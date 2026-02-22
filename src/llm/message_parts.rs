@@ -76,11 +76,19 @@ fn parse_image_marker_payload(
 }
 
 fn clean_marker_value(value: &str) -> String {
-    value
+    let value = value
         .trim()
         .trim_matches('"')
         .trim_matches('\'')
-        .to_string()
+        .to_string();
+    decode_html_entities_basic(&value)
+}
+
+fn decode_html_entities_basic(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+        .replace("&quot;", "\"")
 }
 
 fn compact_spaces(input: &str) -> String {

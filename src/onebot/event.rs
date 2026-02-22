@@ -46,15 +46,21 @@ pub struct SenderInfo {
     pub card: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CqImageRef {
+    pub url: Option<String>,
+    pub file: Option<String>,
+}
+
 impl MessageEvent {
     pub fn text(&self) -> String {
         // 优先使用结构化消息段，图片/at 等内容在这里更完整。
         if let MessagePayload::Segments(segments) = &self.message {
             let mut normalized = segments_to_text(segments);
             // 某些实现只在 raw_message 的 CQ 码里带 url，补齐到标准占位。
-            for url in extract_cq_image_urls(&self.raw_message) {
-                let marker = format!("[IMAGE:url={url}]");
-                if !normalized.contains(&marker) {
+            for image_ref in extract_cq_image_refs(&self.raw_message) {
+                if !contains_image_ref_marker(&normalized, &image_ref) {
+                    let marker = image_ref_to_marker(&image_ref);
                     if !normalized.is_empty() {
                         normalized.push(' ');
                     }
@@ -67,8 +73,18 @@ impl MessageEvent {
         }
 
         if let MessagePayload::Text(text) = &self.message {
-            if !text.trim().is_empty() {
-                return text.clone();
+            let mut normalized = text.clone();
+            for image_ref in extract_cq_image_refs(&self.raw_message) {
+                if !contains_image_ref_marker(&normalized, &image_ref) {
+                    let marker = image_ref_to_marker(&image_ref);
+                    if !normalized.is_empty() {
+                        normalized.push(' ');
+                    }
+                    normalized.push_str(&marker);
+                }
+            }
+            if !normalized.trim().is_empty() {
+                return normalized;
             }
         }
 
@@ -95,6 +111,61 @@ impl MessageEvent {
 
         self.user_id.to_string()
     }
+
+    pub fn image_file_ids(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let MessagePayload::Segments(segments) = &self.message {
+            for segment in segments {
+                if segment.kind != "image" {
+                    continue;
+                }
+                if let Some(file) = segment.data.get("file").and_then(Value::as_str) {
+                    let file = file.trim();
+                    if !file.is_empty() && seen.insert(file.to_string()) {
+                        out.push(file.to_string());
+                    }
+                }
+            }
+        }
+
+        for image_ref in extract_cq_image_refs(&self.raw_message) {
+            if let Some(file) = image_ref.file {
+                if !file.is_empty() && seen.insert(file.clone()) {
+                    out.push(file);
+                }
+            }
+        }
+
+        out
+    }
+
+    pub fn reply_message_ids(&self) -> Vec<i64> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let MessagePayload::Segments(segments) = &self.message {
+            for segment in segments {
+                if segment.kind != "reply" {
+                    continue;
+                }
+                if let Some(id) = extract_i64_from_value(segment.data.get("id")) {
+                    if seen.insert(id) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+
+        for id in extract_cq_reply_ids(&self.raw_message) {
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
+
+        out
+    }
 }
 
 fn segments_to_text(segments: &[MessageSegment]) -> String {
@@ -115,13 +186,17 @@ fn segments_to_text(segments: &[MessageSegment]) -> String {
                 }
             }
             "image" => {
-                if let Some(url) = segment.data.get("url").and_then(Value::as_str) {
-                    out.push_str(&format!("[IMAGE:url={url}]"));
-                } else if let Some(file) = segment.data.get("file").and_then(Value::as_str) {
-                    out.push_str(&format!("[IMAGE:file={file}]"));
-                } else {
-                    out.push_str("[IMAGE]");
-                }
+                let url = segment
+                    .data
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(normalize_image_ref_value);
+                let file = segment
+                    .data
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .map(normalize_image_ref_value);
+                out.push_str(&image_ref_to_marker(&CqImageRef { url, file }));
             }
             _ => {}
         }
@@ -130,9 +205,10 @@ fn segments_to_text(segments: &[MessageSegment]) -> String {
     out
 }
 
-fn extract_cq_image_urls(raw: &str) -> Vec<String> {
+pub fn extract_cq_image_refs(raw: &str) -> Vec<CqImageRef> {
     let mut out = Vec::new();
     let mut cursor = 0;
+    let mut seen = std::collections::HashSet::new();
 
     while let Some(start_rel) = raw[cursor..].find("[CQ:image,") {
         let start = cursor + start_rel;
@@ -141,16 +217,117 @@ fn extract_cq_image_urls(raw: &str) -> Vec<String> {
         };
         let end = start + end_rel;
         let segment = &raw[start + 1..end]; // CQ:image,...
+        let mut url = None::<String>;
+        let mut file = None::<String>;
         for field in segment.split(',') {
-            if let Some(url) = field.trim().strip_prefix("url=") {
-                let url = url.trim().trim_matches('"').trim_matches('\'');
-                if !url.is_empty() && !out.iter().any(|v| v == url) {
-                    out.push(url.to_string());
+            if let Some(value) = field.trim().strip_prefix("url=") {
+                let value = normalize_image_ref_value(value);
+                if !value.is_empty() {
+                    url = Some(value);
                 }
             }
+            if let Some(value) = field.trim().strip_prefix("file=") {
+                let value = normalize_image_ref_value(value);
+                if !value.is_empty() {
+                    file = Some(value);
+                }
+            }
+        }
+
+        let image_ref = CqImageRef { url, file };
+        let dedup_key = format!(
+            "{}|{}",
+            image_ref.url.clone().unwrap_or_default(),
+            image_ref.file.clone().unwrap_or_default()
+        );
+        if seen.insert(dedup_key) {
+            out.push(image_ref);
         }
         cursor = end + 1;
     }
 
     out
+}
+
+pub fn extract_cq_reply_ids(raw: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(start_rel) = raw[cursor..].find("[CQ:reply,") {
+        let start = cursor + start_rel;
+        let Some(end_rel) = raw[start..].find(']') else {
+            break;
+        };
+        let end = start + end_rel;
+        let segment = &raw[start + 1..end]; // CQ:reply,...
+
+        for field in segment.split(',') {
+            if let Some(id_str) = field.trim().strip_prefix("id=") {
+                if let Ok(id) = id_str
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .parse::<i64>()
+                {
+                    if seen.insert(id) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+
+        cursor = end + 1;
+    }
+
+    out
+}
+
+fn image_ref_to_marker(image_ref: &CqImageRef) -> String {
+    match (&image_ref.url, &image_ref.file) {
+        (Some(url), Some(file)) => format!("[IMAGE:url={url},file={file}]"),
+        (Some(url), None) => format!("[IMAGE:url={url}]"),
+        (None, Some(file)) => format!("[IMAGE:file={file}]"),
+        (None, None) => "[IMAGE]".to_string(),
+    }
+}
+
+fn extract_i64_from_value(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(v) = value.as_i64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_str() {
+        return v.trim().parse::<i64>().ok();
+    }
+    None
+}
+
+fn normalize_image_ref_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+}
+
+fn contains_image_ref_marker(text: &str, image_ref: &CqImageRef) -> bool {
+    let url_hit = image_ref
+        .url
+        .as_ref()
+        .map(|url| text.contains(&format!("url={url}")))
+        .unwrap_or(false);
+    let file_hit = image_ref
+        .file
+        .as_ref()
+        .map(|file| text.contains(&format!("file={file}")))
+        .unwrap_or(false);
+
+    match (&image_ref.url, &image_ref.file) {
+        (Some(_), Some(_)) => url_hit && file_hit,
+        (Some(_), None) => url_hit,
+        (None, Some(_)) => file_hit,
+        (None, None) => false,
+    }
 }
