@@ -7,6 +7,7 @@
 # Editor files
 .vscode/
 .idea/
+.claude/
 
 # Logs
 *.log

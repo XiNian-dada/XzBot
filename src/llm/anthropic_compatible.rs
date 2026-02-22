@@ -12,7 +12,7 @@ use crate::{
         message_parts::{parse_user_content, ParsedUserContent},
     },
     tools::system::get_system_info,
-    tools::web::{fetch_url, search_web},
+    tools::web::{extract_urls, fetch_url, search_web},
 };
 
 pub struct AnthropicCompatibleLlm {
@@ -78,8 +78,22 @@ impl Llm for AnthropicCompatibleLlm {
             turns = turns[start..].to_vec();
         }
 
+        let latest_user_text = turns
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.clone())
+            .unwrap_or_default();
         let request_messages = self.build_request_messages(turns).await?;
-        let system_text = build_hardened_system(system_parts.join("\n\n").trim());
+        let mut system_text = build_hardened_system(system_parts.join("\n\n").trim());
+        if let Some(url_context) = self
+            .preload_current_turn_url_context(&latest_user_text)
+            .await?
+        {
+            system_text.push_str("\n\n当前轮 URL 抓取结果（仅作事实依据）：\n");
+            system_text.push_str(&url_context);
+            system_text.push_str("\n请优先基于上述抓取结果回答；若与用户说法冲突，必须明确指出。");
+        }
 
         let reply = self
             .chat_with_function_calls(request_messages, system_text)
@@ -98,20 +112,33 @@ impl AnthropicCompatibleLlm {
         let tools = anthropic_tools_schema();
 
         for round in 0..=MAX_TOOL_ROUNDS {
+            let stage = if has_anthropic_tool_results(&messages) {
+                "final_answer"
+            } else {
+                "tool_planning"
+            };
+            let temperature = if stage == "tool_planning" {
+                self.tool_planning_temperature()
+            } else {
+                self.answer_temperature()
+            };
+
             if self.debug {
                 println!(
-                    "[DEBUG] calling Anthropic-compatible endpoint={} model={} messages={} round={}",
+                    "[DEBUG] calling Anthropic-compatible endpoint={} model={} messages={} round={} stage={} temperature={:.2}",
                     self.endpoint,
                     self.model,
                     messages.len(),
-                    round
+                    round,
+                    stage,
+                    temperature
                 );
             }
 
             let payload = json!({
                 "model": self.model,
                 "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
+                "temperature": temperature,
                 "messages": messages,
                 "system": system_text,
                 "tools": tools,
@@ -187,6 +214,19 @@ impl AnthropicCompatibleLlm {
         bail!("tool call rounds exceeded")
     }
 
+    fn answer_temperature(&self) -> f32 {
+        if !self.temperature.is_finite() {
+            return 0.55;
+        }
+        // 回答阶段保持稳定可读，避免过高温度导致跑题。
+        self.temperature.clamp(0.3, 0.75)
+    }
+
+    fn tool_planning_temperature(&self) -> f32 {
+        // 工具选择阶段用更低温度，减少误选工具和幻觉。
+        (self.answer_temperature() * 0.4).clamp(0.05, 0.25)
+    }
+
     async fn build_request_messages(&self, turns: Vec<(String, String)>) -> Result<Vec<Value>> {
         let mut out = Vec::with_capacity(turns.len());
         let last_user_idx = turns.iter().rposition(|(role, _)| role == "user");
@@ -208,6 +248,33 @@ impl AnthropicCompatibleLlm {
         }
 
         Ok(out)
+    }
+
+    async fn preload_current_turn_url_context(
+        &self,
+        latest_user_text: &str,
+    ) -> Result<Option<String>> {
+        let mut urls = extract_urls(latest_user_text);
+        if urls.is_empty() {
+            return Ok(None);
+        }
+
+        urls.truncate(2);
+        let mut blocks = Vec::new();
+        for url in urls {
+            match fetch_url(&self.client, &url, self.debug).await {
+                Ok(content) => blocks.push(content),
+                Err(err) => blocks.push(format!("URL: {url}\n抓取失败: {err}")),
+            }
+        }
+
+        if self.debug {
+            println!(
+                "[DEBUG] preload current-turn url context blocks={}",
+                blocks.len()
+            );
+        }
+        Ok(Some(blocks.join("\n\n---\n\n")))
     }
 
     async fn build_anthropic_user_blocks(&self, parsed: ParsedUserContent) -> Value {
@@ -428,6 +495,22 @@ fn anthropic_tools_schema() -> Value {
             }
         }
     ])
+}
+
+fn has_anthropic_tool_results(messages: &[Value]) -> bool {
+    messages.iter().any(|msg| {
+        let role = msg.get("role").and_then(Value::as_str);
+        if role != Some("user") {
+            return false;
+        }
+
+        let Some(content) = msg.get("content").and_then(Value::as_array) else {
+            return false;
+        };
+        content
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+    })
 }
 
 fn parse_content_blocks(blocks: &[Value]) -> (String, Vec<ToolCall>) {
