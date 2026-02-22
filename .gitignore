@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# macOS
+.DS_Store
+
+# Editor files
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Local secrets
+.env
+.env.*
+config.local.toml
+
+# Runtime-generated config next to binary
+**/config/config.toml

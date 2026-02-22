@@ -1,0 +1,146 @@
+# =========================
+# XzBot Runtime Config
+# =========================
+# 这份配置用于：
+# 1) 启动 XzBot 服务（本项目）
+# 2) 约束群聊/私聊触发与权限
+# 3) 配置 AI 参数与人设
+#
+# 重要：当前项目只处理 OneBot v11 的「反向 WebSocket」接入。
+# 即：NapCat 主动连接到本服务，本服务是 WS 服务端。
+# 不依赖 OneBot HTTP 上报，也不依赖正向 WS。
+
+# 全局调试开关：
+# false: 只输出必要日志（启动、错误）
+# true : 输出详细调试日志（路由判定、触发命中、AI 请求元信息）
+debug = false
+
+[server]
+# XzBot 监听地址
+# host = "0.0.0.0" 代表监听所有网卡；只本机调试可改成 "127.0.0.1"
+host = "0.0.0.0"
+
+# XzBot 监听端口
+port = 3000
+
+# 反向 WS 路径（NapCat 连接 URL 必须与此一致）
+# 最终地址示例：ws://127.0.0.1:3000/onebot/v11/ws
+ws_path = "/onebot/v11/ws"
+
+# 连接 token（可选）
+# 当 verify_token = true 时，NapCat 传入的 token 必须等于这里的值。
+# 当 verify_token = false 时，此字段会被忽略。
+access_token = ""
+
+# 是否启用 token 校验
+# false: 不校验（本地联调推荐）
+# true : 校验 token（公网部署建议开启）
+verify_token = false
+
+# -------------------------
+# NapCat 对接说明（重点）
+# -------------------------
+# 你需要在 NapCat 中启用：OneBot v11 反向 WebSocket（Reverse WS Client）
+#
+# NapCat 里常见四种能力（名字可能因版本略有差异）：
+# - WS 服务端（正向 WebSocket，NapCat 等别人来连）
+# - WS 客户端（反向 WebSocket，NapCat 主动连出去）  <-- 本项目只需要这个
+# - HTTP 服务端（正向 HTTP 调用）
+# - HTTP 客户端（事件 POST 上报）
+#
+# 本项目建议：
+# - 开启：WS 客户端（反向 WS）
+# - 可关闭：WS 服务端 / HTTP 服务端 / HTTP 客户端（如果你没有其他系统依赖它们）
+#
+# NapCat 反向 WS 目标地址：
+# - ws://<XzBot主机IP>:<port><ws_path>
+# - 例如：ws://192.168.1.10:3000/onebot/v11/ws
+#
+# token 传递兼容（XzBot 当前支持）：
+# - Header: Authorization: Bearer <token>
+# - Header: X-Access-Token: <token>
+# - Header: access_token: <token>
+# - Query : ?access_token=<token> 或 ?token=<token>
+#
+# 如果你开启 verify_token=true，请确保 NapCat 的 token 与 access_token 完全一致。
+
+[owner]
+# 机器人主人 QQ（用于 owner_only 权限策略）
+qq = 123456789
+
+[policy]
+# 权限模式：
+# - "none"       : 不做权限限制（仍会受 group.blacklist 影响）
+# - "owner_only" : 仅允许 owner 私聊
+# - "whitelist"  : 私聊都允许；群聊仅 whitelist 内群号允许
+permission = "whitelist"
+
+[group]
+# 群白名单（permission = "whitelist" 时生效）
+whitelist = [11111111, 22222222]
+
+# 群黑名单（最高优先级，永远拒绝）
+blacklist = []
+
+# 群触发模式：
+# - "at"      : 必须 @机器人 才触发
+# - "prefix"  : 以 prefixes 任一前缀开头触发
+# - "keyword" : 命中 keywords（词边界匹配）触发
+# - "mixed"   : at / prefix / keyword 任一满足即触发
+trigger_mode = "mixed"
+
+# 命令前缀（trigger_mode 包含 prefix 时使用）
+# 例如 "/ai 你好"、"ai hello"
+prefixes = ["/ai", "ai "]
+
+# 关键词（trigger_mode 包含 keyword 时使用）
+keywords = ["xz", "XzBot"]
+
+# 是否要求必须 @机器人 才允许触发
+# true  : 即使 prefix/keyword 命中，也必须先 @
+# false : 不强制 @，按 trigger_mode 判定
+require_at = true
+
+# 群回复是否 @消息发送者
+mention_sender = true
+
+[persona]
+# System Prompt（每轮对话会作为 system 消息注入）
+system = """
+你是 XzBot，一个克制、工程化风格的 AI 助手。
+回答要简洁、直接、可执行。
+"""
+
+[ai]
+# LLM 提供方：
+# - "mock"               : 本地 mock，返回 AI Reply: xxx（不调用外网）
+# - "openai_compatible"  : 调用 OpenAI 兼容接口（/chat/completions）
+# - "anthropic_compatible": 调用 Anthropic 兼容接口（/messages，x-api-key）
+provider = "openai_compatible"
+
+# API 基础地址：
+# - openai_compatible: 例如 https://api.openai.com/v1
+# - anthropic_compatible: 例如 https://code.newcli.com/claude/aws/v1
+#   也支持直接填完整地址 .../messages
+base_url = "https://api.openai.com/v1"
+
+# API Key（真实接入时填写）
+# - openai_compatible 会走 Authorization: Bearer <api_key>
+# - anthropic_compatible 会走 x-api-key: <api_key>
+api_key = "REPLACE_WITH_YOUR_API_KEY"
+
+# 模型名
+model = "gpt-4.1-mini"
+
+# 采样温度
+temperature = 0.7
+
+# 最大输出 token
+max_tokens = 512
+
+# 请求超时（毫秒）
+timeout_ms = 20000
+
+# anthropic_compatible 的版本头
+# 对应请求头 anthropic-version
+anthropic_version = "2023-06-01"
