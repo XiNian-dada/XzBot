@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use dashmap::{mapref::entry::Entry, DashMap};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
@@ -9,14 +10,15 @@ use crate::{
     logger::debug as log_debug,
     onebot::{action::ActionRequest, event::MessageEvent},
     store::memory::{MemoryStore, SessionKey},
+    token_stats,
 };
 
 pub struct AiChatPlugin {
     store: Arc<MemoryStore>,
     llm: Arc<dyn Llm>,
     config: Arc<Config>,
-    // 全局串行化 AI 生成，避免并发请求串上下文。
-    reply_lock: Arc<Semaphore>,
+    // 按会话串行化 AI 生成：群聊按 group_id，私聊按 user_id。
+    reply_locks: Arc<DashMap<String, Arc<Semaphore>>>,
 }
 
 impl AiChatPlugin {
@@ -25,7 +27,7 @@ impl AiChatPlugin {
             store,
             llm,
             config,
-            reply_lock: Arc::new(Semaphore::new(1)),
+            reply_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -68,7 +70,7 @@ impl AiChatPlugin {
             self.config.debug,
             format!("private prompt user_id={} text={}", event.user_id, trimmed),
         );
-        let Some(_permit) = self.try_acquire_reply_lock() else {
+        let Some(_permit) = self.try_acquire_reply_lock(&key) else {
             return Ok(Some(ActionRequest::send_private_msg(
                 event.user_id,
                 "别急别急，我还在回复上一条消息。".to_string(),
@@ -137,7 +139,7 @@ impl AiChatPlugin {
                 group_id, event.user_id, prompt
             ),
         );
-        let Some(_permit) = self.try_acquire_reply_lock() else {
+        let Some(_permit) = self.try_acquire_reply_lock(&key) else {
             let busy = if self.config.group.mention_sender {
                 format!(
                     "[CQ:at,qq={}] 别急别急，我还在回复上一条消息。",
@@ -161,11 +163,24 @@ impl AiChatPlugin {
         self.store.push_user_message(key.clone(), user_input);
         let mut history = self.store.messages(&key);
 
-        if !self.config.persona.system.trim().is_empty() {
-            history.insert(
-                0,
-                ("system".to_string(), self.config.persona.system.clone()),
-            );
+        let (resolved_prompt, matched_group_override) =
+            self.config.persona.resolve_system_for_group(key.group_id);
+        let system_prompt = resolved_prompt.trim().to_string();
+        if let Some(group_id) = key.group_id {
+            if let Some(matched) = matched_group_override {
+                log_debug(
+                    self.config.debug,
+                    format!("persona override applied group_id={group_id} matched={matched}"),
+                );
+            } else {
+                log_debug(
+                    self.config.debug,
+                    format!("persona override not found group_id={group_id}, fallback default"),
+                );
+            }
+        }
+        if !system_prompt.is_empty() {
+            history.insert(0, ("system".to_string(), system_prompt));
         }
 
         let session_id = format!(
@@ -182,20 +197,45 @@ impl AiChatPlugin {
                 session_id
             ),
         );
+        let token_before = token_stats::snapshot();
         let reply = self.llm.chat(session_id, history).await?;
+        let token_after = token_stats::snapshot();
+        let token_delta = token_stats::diff(token_before, token_after);
         self.store.push_assistant_message(key, reply.clone());
         log_debug(
             self.config.debug,
             format!("llm reply length={}", reply.len()),
         );
+        println!(
+            "[TOKEN] this_call: prompt={} completion={} total={} | cumulative: prompt={} completion={} total={}",
+            token_delta.prompt,
+            token_delta.completion,
+            token_delta.total,
+            token_after.prompt,
+            token_after.completion,
+            token_after.total
+        );
         Ok(reply)
     }
 
-    fn try_acquire_reply_lock(&self) -> Option<OwnedSemaphorePermit> {
-        match self.reply_lock.clone().try_acquire_owned() {
+    fn try_acquire_reply_lock(&self, key: &SessionKey) -> Option<OwnedSemaphorePermit> {
+        let lock_key = key.session_id();
+        let semaphore = match self.reply_locks.entry(lock_key.clone()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let semaphore = Arc::new(Semaphore::new(1));
+                entry.insert(semaphore.clone());
+                semaphore
+            }
+        };
+
+        match semaphore.try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
-                log_debug(self.config.debug, "reply lock busy");
+                log_debug(
+                    self.config.debug,
+                    format!("reply lock busy lock_key={lock_key}"),
+                );
                 None
             }
         }

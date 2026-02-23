@@ -1,4 +1,4 @@
-use std::{fs, io::ErrorKind, path::Path};
+use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -99,6 +99,23 @@ impl Config {
         if self.group.trigger_mode == TriggerMode::Keyword && self.group.keywords.is_empty() {
             bail!("group.keywords cannot be empty when trigger_mode = \"keyword\"");
         }
+        let mut seen_group_override = HashSet::new();
+        for (idx, item) in self.persona.group_overrides.iter().enumerate() {
+            if item.groups.is_empty() {
+                bail!("persona.group_overrides[{idx}].groups cannot be empty");
+            }
+            if item.system.trim().is_empty() {
+                bail!("persona.group_overrides[{idx}].system cannot be empty");
+            }
+            for group_id in &item.groups {
+                if *group_id <= 0 {
+                    bail!("persona.group_overrides[{idx}].groups contains invalid group id: {group_id}");
+                }
+                if !seen_group_override.insert(*group_id) {
+                    bail!("persona.group_overrides has duplicated group id: {group_id}");
+                }
+            }
+        }
 
         Ok(())
     }
@@ -162,6 +179,28 @@ pub enum TriggerMode {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonaConfig {
+    pub system: String,
+    #[serde(default)]
+    pub group_overrides: Vec<GroupPersonaOverride>,
+}
+
+impl PersonaConfig {
+    pub fn resolve_system_for_group(&self, group_id: Option<i64>) -> (&str, Option<i64>) {
+        if let Some(group_id) = group_id {
+            for item in &self.group_overrides {
+                if item.groups.iter().any(|id| *id == group_id) && !item.system.trim().is_empty() {
+                    return (item.system.as_str(), Some(group_id));
+                }
+            }
+        }
+        (self.system.as_str(), None)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupPersonaOverride {
+    #[serde(default)]
+    pub groups: Vec<i64>,
     pub system: String,
 }
 

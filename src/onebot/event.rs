@@ -284,8 +284,9 @@ pub fn extract_cq_reply_ids(raw: &str) -> Vec<i64> {
 }
 
 fn image_ref_to_marker(image_ref: &CqImageRef) -> String {
+    // 优先保留 url，避免同时携带 file 导致后续重复加载/无效 file 引用。
     match (&image_ref.url, &image_ref.file) {
-        (Some(url), Some(file)) => format!("[IMAGE:url={url},file={file}]"),
+        (Some(url), Some(_)) => format!("[IMAGE:url={url}]"),
         (Some(url), None) => format!("[IMAGE:url={url}]"),
         (None, Some(file)) => format!("[IMAGE:file={file}]"),
         (None, None) => "[IMAGE]".to_string(),

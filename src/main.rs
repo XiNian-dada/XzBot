@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -22,7 +23,7 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::timeout;
 
 use crate::{
@@ -33,6 +34,7 @@ use crate::{
         openai_compatible::OpenAiCompatibleLlm, Llm,
     },
     logger::{debug as log_debug, error as log_error, info as log_info, warn as log_warn},
+    onebot::action::ActionRequest,
     onebot::event::{extract_cq_image_refs, MessageEvent},
     store::memory::MemoryStore,
 };
@@ -43,10 +45,17 @@ mod llm;
 mod logger;
 mod onebot;
 mod store;
+mod token_stats;
 mod tools;
 
 #[derive(Clone)]
 struct AppState {
+    runtime: Arc<RwLock<RuntimeState>>,
+    config_path: Arc<PathBuf>,
+    store: Arc<MemoryStore>,
+}
+
+struct RuntimeState {
     router: Arc<BotRouter>,
     config: Arc<Config>,
 }
@@ -126,26 +135,17 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(Config::load(&config_path)?);
     let store = Arc::new(MemoryStore::new());
-    let llm: Arc<dyn Llm> = match config.ai.provider {
-        AiProvider::Mock => Arc::new(MockLlm::new(config.debug, config.ai.timeout_ms)?),
-        AiProvider::OpenaiCompatible => {
-            Arc::new(OpenAiCompatibleLlm::from_config(&config.ai, config.debug)?)
-        }
-        AiProvider::AnthropicCompatible => Arc::new(AnthropicCompatibleLlm::from_config(
-            &config.ai,
-            config.debug,
-        )?),
-    };
-    let ai_chat = AiChatPlugin::new(store, llm, config.clone());
-    let router = Arc::new(BotRouter::new(ai_chat, config.clone()));
+    let runtime = Arc::new(RwLock::new(build_runtime(config.clone(), store.clone())?));
+
     let ws_path = config.server.ws_path.clone();
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
 
     let app = Router::new()
         .route(ws_path.as_str(), get(onebot_ws_handler))
         .with_state(AppState {
-            router,
-            config: config.clone(),
+            runtime,
+            config_path: Arc::new(config_path.clone()),
+            store,
         });
 
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -158,20 +158,42 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_runtime(config: Arc<Config>, store: Arc<MemoryStore>) -> anyhow::Result<RuntimeState> {
+    let llm: Arc<dyn Llm> = match config.ai.provider {
+        AiProvider::Mock => Arc::new(MockLlm::new(config.debug, config.ai.timeout_ms)?),
+        AiProvider::OpenaiCompatible => {
+            Arc::new(OpenAiCompatibleLlm::from_config(&config.ai, config.debug)?)
+        }
+        AiProvider::AnthropicCompatible => Arc::new(AnthropicCompatibleLlm::from_config(
+            &config.ai,
+            config.debug,
+        )?),
+    };
+    let ai_chat = AiChatPlugin::new(store, llm, config.clone());
+    let router = Arc::new(BotRouter::new(ai_chat, config.clone()));
+
+    Ok(RuntimeState { router, config })
+}
+
 async fn onebot_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if state.config.server.verify_token {
-        let expected = state.config.server.access_token.trim();
+    let config = {
+        let runtime = state.runtime.read().await;
+        runtime.config.clone()
+    };
+
+    if config.server.verify_token {
+        let expected = config.server.access_token.trim();
         let provided = extract_access_token(&headers, &query);
         if provided.as_deref() != Some(expected) {
             log_warn("websocket rejected: invalid access token");
             return (StatusCode::UNAUTHORIZED, "invalid access token").into_response();
         }
-        log_debug(state.config.debug, "websocket token verified");
+        log_debug(config.debug, "websocket token verified");
     }
 
     ws.on_upgrade(move |socket| handle_socket(socket, state))
@@ -181,7 +203,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     log_info("websocket connected");
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let debug = state.config.debug;
+    let debug = {
+        let runtime = state.runtime.read().await;
+        runtime.config.debug
+    };
     let bridge = WsActionBridge::new(tx.clone(), debug);
 
     let writer = tokio::spawn(async move {
@@ -209,16 +234,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         match message {
             Message::Text(text) => {
-                log_debug(
-                    state.config.debug,
-                    format!("incoming ws text length={}", text.len()),
-                );
+                let debug = {
+                    let runtime = state.runtime.read().await;
+                    runtime.config.debug
+                };
+                log_debug(debug, format!("incoming ws text length={}", text.len()));
                 handle_incoming_payload(text.as_str(), &state, &bridge, &tx);
             }
             Message::Binary(bytes) => {
                 if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                    let debug = {
+                        let runtime = state.runtime.read().await;
+                        runtime.config.debug
+                    };
                     log_debug(
-                        state.config.debug,
+                        debug,
                         format!("incoming ws binary utf8 length={}", text.len()),
                     );
                     handle_incoming_payload(&text, &state, &bridge, &tx);
@@ -279,19 +309,28 @@ async fn process_incoming(
         }
     };
 
-    if let Err(err) = enrich_event_images(&mut event, bridge, state.config.debug).await {
+    let (config, router) = {
+        let runtime = state.runtime.read().await;
+        (runtime.config.clone(), runtime.router.clone())
+    };
+
+    if let Err(err) = enrich_event_images(&mut event, bridge, config.debug).await {
         log_warn(format!("failed to enrich image context: {err}"));
     }
 
     log_debug(
-        state.config.debug,
+        config.debug,
         format!(
             "event message_type={} user_id={} group_id={:?}",
             event.message_type, event.user_id, event.group_id
         ),
     );
 
-    let action = match state.router.route_message(event).await {
+    if let Some(action) = try_reload_config_command(state, &event, &config).await {
+        return serde_json::to_string(&action).ok();
+    }
+
+    let action = match router.route_message(event).await {
         Ok(action) => action,
         Err(err) => {
             log_error(format!("route message failed: {err}"));
@@ -302,6 +341,101 @@ async fn process_incoming(
     action.and_then(|v| serde_json::to_string(&v).ok())
 }
 
+struct ReloadOutcome {
+    config: Arc<Config>,
+    server_rebind_required: bool,
+}
+
+async fn try_reload_config_command(
+    state: &AppState,
+    event: &MessageEvent,
+    config: &Config,
+) -> Option<ActionRequest> {
+    if !is_reload_command(event, config.owner.qq) {
+        return None;
+    }
+
+    match reload_runtime(state).await {
+        Ok(outcome) => {
+            log_info(format!(
+                "config reloaded: provider={} model={}",
+                outcome.config.ai.provider.as_str(),
+                outcome.config.ai.model
+            ));
+
+            let mut msg = format!(
+                "配置已重载。provider={} model={}",
+                outcome.config.ai.provider.as_str(),
+                outcome.config.ai.model
+            );
+            if outcome.server_rebind_required {
+                msg.push_str(
+                    "；检测到 server.host/server.port/server.ws_path 变更，需重启进程后生效。",
+                );
+            }
+            Some(reload_reply_action(event, msg))
+        }
+        Err(err) => {
+            log_error(format!("reload config failed: {err:#}"));
+            Some(reload_reply_action(event, format!("配置重载失败：{err}")))
+        }
+    }
+}
+
+fn is_reload_command(event: &MessageEvent, owner_qq: i64) -> bool {
+    if event.user_id != owner_qq {
+        return false;
+    }
+
+    let text = event.text();
+    let trimmed = text.trim();
+    if event.message_type == "private" {
+        return trimmed == "/reload";
+    }
+
+    if event.message_type != "group" {
+        return false;
+    }
+
+    let at_me = format!("[CQ:at,qq={}]", event.self_id);
+    if !text.contains(&at_me) {
+        return false;
+    }
+
+    text.replace(&at_me, "").trim() == "/reload"
+}
+
+fn reload_reply_action(event: &MessageEvent, message: String) -> ActionRequest {
+    if event.message_type == "group" {
+        if let Some(group_id) = event.group_id {
+            return ActionRequest::send_group_msg(
+                group_id,
+                format!("[CQ:at,qq={}] {}", event.user_id, message),
+            );
+        }
+    }
+    ActionRequest::send_private_msg(event.user_id, message)
+}
+
+async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
+    let config_path = state.config_path.as_ref();
+    let new_config = Arc::new(Config::load(config_path)?);
+    let new_runtime = build_runtime(new_config.clone(), state.store.clone())?;
+
+    let mut runtime = state.runtime.write().await;
+    let old_config = runtime.config.clone();
+    *runtime = new_runtime;
+
+    let server_rebind_required = old_config.server.host != new_config.server.host
+        || old_config.server.port != new_config.server.port
+        || old_config.server.ws_path != new_config.server.ws_path;
+
+    Ok(ReloadOutcome {
+        config: new_config,
+        server_rebind_required,
+    })
+}
+
 async fn enrich_event_images(
     event: &mut MessageEvent,
     bridge: &WsActionBridge,
@@ -309,6 +443,8 @@ async fn enrich_event_images(
 ) -> anyhow::Result<()> {
     let mut urls = Vec::new();
     let mut seen = HashSet::new();
+    let mut quote_texts = Vec::new();
+    let mut seen_quote_texts = HashSet::new();
 
     // 1) 当前消息里的图片 file id -> 尝试 get_image 解析 URL。
     for file_id in event.image_file_ids().into_iter().take(4) {
@@ -334,6 +470,12 @@ async fn enrich_event_images(
 
         let data = response.get("data").cloned().unwrap_or(Value::Null);
         let (quoted_urls, quoted_files) = collect_image_refs_from_message_data(&data);
+        if let Some(quote_text) = extract_quote_text_from_message_data(&data) {
+            let normalized = quote_text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !normalized.is_empty() && seen_quote_texts.insert(normalized.clone()) {
+                quote_texts.push(format!("[引用消息] {}", trim_for_context(&normalized, 220)));
+            }
+        }
 
         for url in quoted_urls {
             if seen.insert(url.clone()) {
@@ -348,6 +490,17 @@ async fn enrich_event_images(
                 }
             }
         }
+    }
+
+    if !quote_texts.is_empty() {
+        if !event.raw_message.is_empty() {
+            event.raw_message.push(' ');
+        }
+        event.raw_message.push_str(&quote_texts.join(" "));
+        log_debug(
+            debug,
+            format!("event quote context enriched count={}", quote_texts.len()),
+        );
     }
 
     if !urls.is_empty() {
@@ -367,6 +520,115 @@ async fn enrich_event_images(
     }
 
     Ok(())
+}
+
+fn extract_quote_text_from_message_data(data: &Value) -> Option<String> {
+    if let Some(message) = data.get("message") {
+        if let Some(text) = message_value_to_text(message) {
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    data.get("raw_message")
+        .and_then(Value::as_str)
+        .map(strip_cq_to_text)
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn message_value_to_text(message: &Value) -> Option<String> {
+    match message {
+        Value::String(raw) => {
+            let text = strip_cq_to_text(raw);
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        Value::Array(segments) => {
+            let mut out = String::new();
+            for seg in segments {
+                let kind = seg.get("type").and_then(Value::as_str).unwrap_or("");
+                match kind {
+                    "text" => {
+                        if let Some(text) = seg
+                            .get("data")
+                            .and_then(|d| d.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            out.push_str(text);
+                        }
+                    }
+                    "image" => {
+                        if !out.ends_with(' ') && !out.is_empty() {
+                            out.push(' ');
+                        }
+                        out.push_str("[图片]");
+                    }
+                    "at" => {
+                        let qq_text = seg.get("data").and_then(|d| d.get("qq")).and_then(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                        });
+                        if let Some(qq) = qq_text {
+                            if !out.ends_with(' ') && !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push('@');
+                            out.push_str(&qq);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let normalized = out.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn strip_cq_to_text(raw: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+
+    while let Some(start_rel) = raw[cursor..].find("[CQ:") {
+        let start = cursor + start_rel;
+        out.push_str(&raw[cursor..start]);
+
+        let Some(end_rel) = raw[start..].find(']') else {
+            out.push_str(&raw[start..]);
+            cursor = raw.len();
+            break;
+        };
+        let end = start + end_rel;
+        let segment = &raw[start + 1..end];
+        if segment.starts_with("CQ:image") {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("[图片]");
+        }
+        cursor = end + 1;
+    }
+
+    out.push_str(&raw[cursor..]);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn trim_for_context(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    chars.into_iter().take(max_chars).collect::<String>() + "...(truncated)"
 }
 
 async fn resolve_image_url(bridge: &WsActionBridge, image_ref: &str) -> Option<String> {

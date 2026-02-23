@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 const DEFAULT_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -28,7 +28,41 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
         println!("[DEBUG] tool.search_web query={query}");
     }
 
-    let variants = build_query_variants(query);
+    let search_client = match build_search_session_client() {
+        Ok(c) => c,
+        Err(err) => {
+            if debug {
+                println!(
+                    "[DEBUG] build search session client failed, fallback shared client: {err}"
+                );
+            }
+            client.clone()
+        }
+    };
+    warmup_bing_session(&search_client, debug).await;
+
+    let pass1_hits = match search_bing(&search_client, query, debug).await {
+        Ok(v) => v,
+        Err(err) => {
+            if debug {
+                println!("[DEBUG] search pass1 failed query={query}: {err}");
+            }
+            Vec::new()
+        }
+    };
+    if debug {
+        println!("[DEBUG] search.pass1 hits={}", pass1_hits.len());
+    }
+
+    let rewritten_query = rewrite_query_for_second_pass(query, &pass1_hits);
+    if debug {
+        println!(
+            "[DEBUG] search.pass2 rewrite query={} -> {}",
+            query, rewritten_query
+        );
+    }
+
+    let variants = build_query_variants(&rewritten_query);
     if debug && variants.len() > 1 {
         println!("[DEBUG] search variants: {}", variants.join(" | "));
     }
@@ -39,12 +73,13 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
             println!("[DEBUG] search strict identifier filter enabled token={token}");
         }
     }
+    let mut strict_identifier_unresolved = false;
 
-    let mut hits = Vec::new();
+    let mut bing_hits = Vec::new();
     for variant in &variants {
-        let before = hits.len();
-        match search_bing(client, variant, debug).await {
-            Ok(mut found) => hits.append(&mut found),
+        let before = bing_hits.len();
+        match search_bing(&search_client, variant, debug).await {
+            Ok(mut found) => bing_hits.append(&mut found),
             Err(err) => {
                 if debug {
                     println!("[DEBUG] search.bing failed query={variant}: {err}");
@@ -55,14 +90,22 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
             println!(
                 "[DEBUG] search.bing variant_done query={} added={} total={}",
                 variant,
-                hits.len().saturating_sub(before),
-                hits.len()
+                bing_hits.len().saturating_sub(before),
+                bing_hits.len()
             );
         }
     }
+    if bing_hits.is_empty() && !pass1_hits.is_empty() {
+        if debug {
+            println!("[DEBUG] search pass2 empty, fallback to pass1 results");
+        }
+        bing_hits = pass1_hits.clone();
+    } else {
+        bing_hits.extend(pass1_hits.clone());
+    }
 
     if let Some(token) = strict_identifier.as_ref() {
-        let mut matched = hits
+        let mut matched = bing_hits
             .iter()
             .filter(|hit| hit_matches_identifier(hit, token))
             .count();
@@ -89,8 +132,8 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
             }
 
             for q in recovery_queries {
-                match search_bing(client, &q, debug).await {
-                    Ok(mut found) => hits.append(&mut found),
+                match search_bing(&search_client, &q, debug).await {
+                    Ok(mut found) => bing_hits.append(&mut found),
                     Err(err) => {
                         if debug {
                             println!("[DEBUG] recovery bing failed query={q}: {err}");
@@ -99,7 +142,7 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
                 }
             }
 
-            matched = hits
+            matched = bing_hits
                 .iter()
                 .filter(|hit| hit_matches_identifier(hit, token))
                 .count();
@@ -107,46 +150,58 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
                 println!("[DEBUG] bing strict identifier recovery matches={matched}");
             }
             if matched == 0 {
-                return Ok(format!(
-                    "未在 Bing 中国检索到包含标识符 `{token}` 的有效结果（已尝试精确匹配与加号强制检索）。\n建议：\n1) 直接附上目标主页链接\n2) 改搜 `+{token}` 或 `+\"{token}\"`\n3) 检查是否存在大小写/下划线/连字符差异"
-                ));
+                strict_identifier_unresolved = true;
             }
         }
     }
 
     if debug {
-        println!("[DEBUG] search.raw total_hits={}", hits.len());
-        debug_log_hits("search.raw", query, &hits, 10);
+        println!("[DEBUG] search.raw total_hits={}", bing_hits.len());
+        debug_log_hits("search.raw", query, &bing_hits, 10);
     }
     if debug {
         if let Some(token) = &strict_identifier {
-            let matched = hits
+            let matched = bing_hits
                 .iter()
                 .filter(|hit| hit_matches_identifier(hit, token))
                 .count();
             println!(
                 "[DEBUG] search strict identifier matches={}/{} token={}",
                 matched,
-                hits.len(),
+                bing_hits.len(),
                 token
             );
         }
     }
 
-    let raw_hits = hits.clone();
-    let mut ranked = rank_search_hits(&variants, hits.clone(), strict_identifier.as_deref());
+    let raw_hits = bing_hits.clone();
+    let mut ranked = rank_search_hits(
+        query,
+        &variants,
+        bing_hits.clone(),
+        strict_identifier.as_deref(),
+    );
     if ranked.is_empty() && strict_identifier.is_some() {
         if debug {
             println!(
                 "[DEBUG] strict identifier filter produced 0 hits, fallback to relaxed ranking"
             );
         }
-        ranked = rank_search_hits(&variants, hits.clone(), None);
+        ranked = rank_search_hits(query, &variants, bing_hits.clone(), None);
     }
+
     if ranked.is_empty() {
         if debug {
             println!("[DEBUG] search.ranked empty after fallback");
             debug_log_hits("search.ranked.empty.raw", query, &raw_hits, 10);
+        }
+
+        if strict_identifier_unresolved {
+            if let Some(token) = &strict_identifier {
+                return Ok(format!(
+                    "未在 Bing 中国检索到包含标识符 `{token}` 的有效结果。\n建议：\n1) 直接附上目标主页链接\n2) 改搜 `+{token}` 或 `+\"{token}\"`\n3) 检查是否存在大小写/下划线/连字符差异"
+                ));
+            }
         }
 
         let fallback_hits = take_unique_hits_preserve_order(raw_hits, 5);
@@ -345,6 +400,49 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     out
 }
 
+fn build_search_session_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(20))
+        .cookie_store(true)
+        .build()
+        .context("failed to build search session client")
+}
+
+async fn warmup_bing_session(client: &Client, debug: bool) {
+    let warmup_url = "https://cn.bing.com/";
+    match client
+        .get(warmup_url)
+        .header("User-Agent", DEFAULT_UA)
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if debug {
+                println!(
+                    "[DEBUG] search.warmup url={} status={}",
+                    warmup_url,
+                    resp.status()
+                );
+            }
+        }
+        Err(err) => {
+            if debug {
+                println!("[DEBUG] search.warmup failed url={}: {}", warmup_url, err);
+            }
+        }
+    }
+}
+
+fn rewrite_query_for_second_pass(query: &str, _pass1_hits: &[SearchHit]) -> String {
+    let normalized = normalize_search_query(query);
+    if normalized.is_empty() {
+        query.trim().to_string()
+    } else {
+        normalized
+    }
+}
+
 async fn search_bing(client: &Client, query: &str, debug: bool) -> Result<Vec<SearchHit>> {
     let encoded = urlencoding::encode(query);
     let mut query_params = format!("q={encoded}&setlang=zh-Hans");
@@ -389,6 +487,153 @@ async fn search_bing(client: &Client, query: &str, debug: bool) -> Result<Vec<Se
             hits.len()
         );
         debug_log_hits("search.bing", query, &hits, 8);
+    }
+    Ok(hits)
+}
+
+#[allow(dead_code)]
+async fn search_domestic_fallback(
+    client: &Client,
+    variants: &[String],
+    debug: bool,
+) -> Vec<SearchHit> {
+    let mut out = Vec::new();
+    let fallback_variants: Vec<&String> = variants.iter().take(3).collect();
+
+    for variant in fallback_variants {
+        match search_baidu(client, variant, debug).await {
+            Ok(mut hits) => out.append(&mut hits),
+            Err(err) => {
+                if debug {
+                    println!("[DEBUG] search.baidu failed query={variant}: {err}");
+                }
+            }
+        }
+        match search_sogou(client, variant, debug).await {
+            Ok(mut hits) => out.append(&mut hits),
+            Err(err) => {
+                if debug {
+                    println!("[DEBUG] search.sogou failed query={variant}: {err}");
+                }
+            }
+        }
+        match search_so360(client, variant, debug).await {
+            Ok(mut hits) => out.append(&mut hits),
+            Err(err) => {
+                if debug {
+                    println!("[DEBUG] search.so failed query={variant}: {err}");
+                }
+            }
+        }
+    }
+
+    out
+}
+
+#[allow(dead_code)]
+async fn search_baidu(client: &Client, query: &str, debug: bool) -> Result<Vec<SearchHit>> {
+    let encoded = urlencoding::encode(query);
+    let search_url = format!("https://www.baidu.com/s?wd={encoded}");
+    let response = client
+        .get(&search_url)
+        .header("User-Agent", DEFAULT_UA)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Referer", "https://www.baidu.com/")
+        .send()
+        .await
+        .with_context(|| format!("search request failed: {search_url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read baidu search response body")?;
+    if !status.is_success() {
+        bail!("search endpoint returned {status}: {body}");
+    }
+
+    let hits = parse_baidu_results(&body)?;
+    if debug {
+        println!(
+            "[DEBUG] search.baidu query={query} url={search_url} hits={}",
+            hits.len()
+        );
+        debug_log_hits("search.baidu", query, &hits, 8);
+    }
+    Ok(hits)
+}
+
+#[allow(dead_code)]
+async fn search_sogou(client: &Client, query: &str, debug: bool) -> Result<Vec<SearchHit>> {
+    let encoded = urlencoding::encode(query);
+    let search_url = format!("https://www.sogou.com/web?query={encoded}");
+    let response = client
+        .get(&search_url)
+        .header("User-Agent", DEFAULT_UA)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Referer", "https://www.sogou.com/")
+        .send()
+        .await
+        .with_context(|| format!("search request failed: {search_url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read sogou search response body")?;
+    if !status.is_success() {
+        bail!("search endpoint returned {status}: {body}");
+    }
+
+    let hits = parse_sogou_results(&body)?;
+    if debug {
+        println!(
+            "[DEBUG] search.sogou query={query} url={search_url} hits={}",
+            hits.len()
+        );
+        debug_log_hits("search.sogou", query, &hits, 8);
+    }
+    Ok(hits)
+}
+
+#[allow(dead_code)]
+async fn search_so360(client: &Client, query: &str, debug: bool) -> Result<Vec<SearchHit>> {
+    let encoded = urlencoding::encode(query);
+    let search_url = format!("https://www.so.com/s?q={encoded}");
+    let response = client
+        .get(&search_url)
+        .header("User-Agent", DEFAULT_UA)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Referer", "https://www.so.com/")
+        .send()
+        .await
+        .with_context(|| format!("search request failed: {search_url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read so.com search response body")?;
+    if !status.is_success() {
+        bail!("search endpoint returned {status}: {body}");
+    }
+
+    let hits = parse_so360_results(&body)?;
+    if debug {
+        println!(
+            "[DEBUG] search.so query={query} url={search_url} hits={}",
+            hits.len()
+        );
+        debug_log_hits("search.so", query, &hits, 8);
     }
     Ok(hits)
 }
@@ -595,6 +840,140 @@ fn parse_bing_results(html: &str) -> Result<Vec<SearchHit>> {
 }
 
 #[allow(dead_code)]
+fn parse_baidu_results(html: &str) -> Result<Vec<SearchHit>> {
+    let doc = Html::parse_document(html);
+    let item_sel = Selector::parse("div.result, div.c-container")
+        .map_err(|err| anyhow!("failed to parse selector baidu item: {err}"))?;
+    let title_sel = Selector::parse("h3 a, a[data-click]")
+        .map_err(|err| anyhow!("failed to parse selector baidu title: {err}"))?;
+    let snippet_sel = Selector::parse(
+        "div.c-abstract, div.content-right_8Zs40, div.c-span-last, div.c-font-normal, span.content-right_8Zs40",
+    )
+    .map_err(|err| anyhow!("failed to parse selector baidu snippet: {err}"))?;
+
+    let mut out = Vec::new();
+    for item in doc.select(&item_sel).take(14) {
+        let Some(title_node) = item.select(&title_sel).next() else {
+            continue;
+        };
+
+        let title = normalize_whitespace(&title_node.text().collect::<Vec<_>>().join(" "));
+        let raw_href = title_node
+            .value()
+            .attr("href")
+            .map(decode_html_entities_basic)
+            .unwrap_or_default();
+        let href = normalize_generic_href(&raw_href);
+        if href.is_empty() || !is_valid_result_url(&href) {
+            continue;
+        }
+
+        let snippet = item
+            .select(&snippet_sel)
+            .next()
+            .map(|n| normalize_whitespace(&n.text().collect::<Vec<_>>().join(" ")))
+            .unwrap_or_default();
+
+        out.push(SearchHit {
+            title,
+            url: href,
+            snippet,
+            source: "baidu",
+        });
+    }
+
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn parse_sogou_results(html: &str) -> Result<Vec<SearchHit>> {
+    let doc = Html::parse_document(html);
+    let item_sel = Selector::parse("div.vrwrap, div.rb, li[class*=\"vr\"]")
+        .map_err(|err| anyhow!("failed to parse selector sogou item: {err}"))?;
+    let title_sel = Selector::parse("h3 a, h2 a, a.vr-title")
+        .map_err(|err| anyhow!("failed to parse selector sogou title: {err}"))?;
+    let snippet_sel = Selector::parse("p.str_info, p.str-text-info, div.text-layout, p")
+        .map_err(|err| anyhow!("failed to parse selector sogou snippet: {err}"))?;
+
+    let mut out = Vec::new();
+    for item in doc.select(&item_sel).take(14) {
+        let Some(title_node) = item.select(&title_sel).next() else {
+            continue;
+        };
+
+        let title = normalize_whitespace(&title_node.text().collect::<Vec<_>>().join(" "));
+        let raw_href = title_node
+            .value()
+            .attr("href")
+            .map(decode_html_entities_basic)
+            .unwrap_or_default();
+        let href = normalize_generic_href(&raw_href);
+        if href.is_empty() || !is_valid_result_url(&href) {
+            continue;
+        }
+
+        let snippet = item
+            .select(&snippet_sel)
+            .next()
+            .map(|n| normalize_whitespace(&n.text().collect::<Vec<_>>().join(" ")))
+            .unwrap_or_default();
+
+        out.push(SearchHit {
+            title,
+            url: href,
+            snippet,
+            source: "sogou",
+        });
+    }
+
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn parse_so360_results(html: &str) -> Result<Vec<SearchHit>> {
+    let doc = Html::parse_document(html);
+    let item_sel = Selector::parse("li.res-list, li.result, div.res-list")
+        .map_err(|err| anyhow!("failed to parse selector so360 item: {err}"))?;
+    let title_sel = Selector::parse("h3 a, h2 a")
+        .map_err(|err| anyhow!("failed to parse selector so360 title: {err}"))?;
+    let snippet_sel = Selector::parse("p.res-desc, p, div.res-desc")
+        .map_err(|err| anyhow!("failed to parse selector so360 snippet: {err}"))?;
+
+    let mut out = Vec::new();
+    for item in doc.select(&item_sel).take(14) {
+        let Some(title_node) = item.select(&title_sel).next() else {
+            continue;
+        };
+
+        let title = normalize_whitespace(&title_node.text().collect::<Vec<_>>().join(" "));
+        let raw_href = title_node
+            .value()
+            .attr("href")
+            .map(decode_html_entities_basic)
+            .unwrap_or_default();
+        let href = normalize_generic_href(&raw_href);
+        if href.is_empty() || !is_valid_result_url(&href) {
+            continue;
+        }
+
+        let snippet = item
+            .select(&snippet_sel)
+            .next()
+            .map(|n| normalize_whitespace(&n.text().collect::<Vec<_>>().join(" ")))
+            .unwrap_or_default();
+
+        out.push(SearchHit {
+            title,
+            url: href,
+            snippet,
+            source: "so360",
+        });
+    }
+
+    Ok(out)
+}
+
+#[allow(dead_code)]
 fn parse_duckduckgo_html_results(html: &str) -> Result<Vec<SearchHit>> {
     let doc = Html::parse_document(html);
     let result_sel = Selector::parse("div.result, .web-result")
@@ -696,11 +1075,13 @@ fn extract_inurl_constraint(query: &str) -> Option<String> {
 }
 
 fn rank_search_hits(
+    original_query: &str,
     query_variants: &[String],
     hits: Vec<SearchHit>,
     strict_identifier: Option<&str>,
 ) -> Vec<SearchHit> {
     let terms = build_query_terms(query_variants);
+    let intent_terms = extract_intent_terms(original_query);
     if hits.is_empty() {
         return Vec::new();
     }
@@ -714,13 +1095,16 @@ fn rank_search_hits(
                 continue;
             }
         }
+        if !intent_terms.is_empty() && !hit_matches_intent_terms(&hit, &intent_terms) {
+            continue;
+        }
 
         let canonical = canonical_url(&hit.url);
         if canonical.is_empty() || !seen.insert(canonical) {
             continue;
         }
 
-        let score = score_hit(&hit, query_variants, &terms);
+        let score = score_hit(&hit, query_variants, &terms, &intent_terms);
         scored.push((score, hit));
     }
 
@@ -1050,6 +1434,92 @@ fn tokenize_query_terms(query: &str) -> Vec<String> {
     out
 }
 
+fn extract_intent_terms(query: &str) -> Vec<String> {
+    let normalized = normalize_search_query(query);
+    let base = if normalized.is_empty() {
+        query
+    } else {
+        normalized.as_str()
+    };
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for term in base.split_whitespace() {
+        let token = term
+            .trim()
+            .trim_matches(|c: char| c == '"' || c == '\'')
+            .trim_start_matches('+')
+            .to_lowercase();
+        if token.chars().count() < 2 {
+            continue;
+        }
+        if is_generic_query_token(&token) {
+            continue;
+        }
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+    }
+
+    let cn_keywords = [
+        "美食", "小吃", "餐厅", "火锅", "烧烤", "足浴", "洗脚", "按摩", "酒店", "住宿", "租房",
+        "攻略", "博客", "官网", "github", "gitee", "天气", "气温", "温度", "新闻", "事件", "教程",
+        "评测",
+    ];
+    let lower_query = query.to_lowercase();
+    for kw in cn_keywords {
+        if lower_query.contains(kw) && seen.insert(kw.to_string()) {
+            out.push(kw.to_string());
+        }
+    }
+
+    out
+}
+
+fn hit_matches_intent_terms(hit: &SearchHit, intent_terms: &[String]) -> bool {
+    if intent_terms.is_empty() {
+        return true;
+    }
+    let title = hit.title.to_lowercase();
+    let snippet = hit.snippet.to_lowercase();
+    let url = hit.url.to_lowercase();
+    intent_terms.iter().any(|term| {
+        title.contains(term.as_str())
+            || snippet.contains(term.as_str())
+            || url.contains(term.as_str())
+    })
+}
+
+fn is_generic_query_token(token: &str) -> bool {
+    matches!(
+        token,
+        "附近"
+            | "周边"
+            | "那里"
+            | "那边"
+            | "有没有"
+            | "有啥"
+            | "有哪些"
+            | "推荐"
+            | "大全"
+            | "最新"
+            | "最近"
+            | "新闻"
+            | "事件"
+            | "什么"
+            | "怎么"
+            | "一下"
+            | "请问"
+            | "帮我"
+            | "搜"
+            | "查"
+            | "look"
+            | "up"
+            | "search"
+    )
+}
+
 fn contains_cjk(text: &str) -> bool {
     text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
 }
@@ -1070,7 +1540,12 @@ fn cjk_bigrams(text: &str) -> Vec<String> {
     out
 }
 
-fn score_hit(hit: &SearchHit, query_variants: &[String], terms: &[String]) -> i32 {
+fn score_hit(
+    hit: &SearchHit,
+    query_variants: &[String],
+    terms: &[String],
+    intent_terms: &[String],
+) -> i32 {
     let title = hit.title.to_lowercase();
     let snippet = hit.snippet.to_lowercase();
     let url = hit.url.to_lowercase();
@@ -1117,6 +1592,21 @@ fn score_hit(hit: &SearchHit, query_variants: &[String], terms: &[String]) -> i3
 
     if is_low_signal_url(&url) {
         score -= 2;
+    }
+
+    if !intent_terms.is_empty() {
+        let intent_match_count = intent_terms
+            .iter()
+            .filter(|term| {
+                title.contains(term.as_str())
+                    || snippet.contains(term.as_str())
+                    || url.contains(term.as_str())
+            })
+            .count();
+        if intent_match_count == 0 {
+            return -100;
+        }
+        score += (intent_match_count as i32) * 6;
     }
 
     score
@@ -1184,6 +1674,15 @@ fn normalize_bing_href(href: &str) -> String {
         }
     }
 
+    href
+}
+
+#[allow(dead_code)]
+fn normalize_generic_href(href: &str) -> String {
+    let href = decode_html_entities_basic(href);
+    if !(href.starts_with("http://") || href.starts_with("https://")) {
+        return String::new();
+    }
     href
 }
 

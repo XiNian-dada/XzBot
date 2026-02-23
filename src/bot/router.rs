@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 
 use crate::{
     bot::ai_chat::AiChatPlugin,
@@ -14,6 +14,7 @@ pub struct BotRouter {
     ai_chat: AiChatPlugin,
     config: Arc<Config>,
     runtime_group_blacklist: DashSet<i64>,
+    group_repeat_state: DashMap<i64, GroupRepeatState>,
 }
 
 impl BotRouter {
@@ -27,6 +28,7 @@ impl BotRouter {
             ai_chat,
             config,
             runtime_group_blacklist,
+            group_repeat_state: DashMap::new(),
         }
     }
 
@@ -52,6 +54,10 @@ impl BotRouter {
                 ),
             );
             return Ok(None);
+        }
+
+        if let Some(action) = self.try_group_repeat(&event) {
+            return Ok(Some(action));
         }
 
         if event.message_type == "group" && !self.should_trigger_group(&event) {
@@ -211,6 +217,59 @@ impl BotRouter {
         }
     }
 
+    fn try_group_repeat(&self, event: &MessageEvent) -> Option<ActionRequest> {
+        if event.message_type != "group" {
+            return None;
+        }
+        let group_id = event.group_id?;
+
+        // 仅在配置白名单群启用“加一”。
+        if !self.config.group.whitelist.contains(&group_id) {
+            return None;
+        }
+
+        // 不处理机器人自己发出的消息，避免循环。
+        if event.user_id == event.self_id {
+            return None;
+        }
+
+        let normalized = normalize_repeat_text(&event.text())?;
+        let mut state = self
+            .group_repeat_state
+            .entry(group_id)
+            .or_insert_with(GroupRepeatState::default);
+
+        // 已经“加一”过同一句，直到出现不同内容前不再触发。
+        if state.muted_text.as_deref() == Some(normalized.as_str()) {
+            state.last_text = Some(normalized);
+            state.streak = state.streak.saturating_add(1);
+            return None;
+        }
+
+        // 出现不同内容，解除静音词。
+        if state.muted_text.is_some() {
+            state.muted_text = None;
+        }
+
+        if state.last_text.as_deref() == Some(normalized.as_str()) {
+            state.streak = state.streak.saturating_add(1);
+        } else {
+            state.last_text = Some(normalized.clone());
+            state.streak = 1;
+        }
+
+        if state.streak >= 2 {
+            state.muted_text = Some(normalized.clone());
+            log_debug(
+                self.config.debug,
+                format!("group repeat +1 group_id={group_id} text={normalized}"),
+            );
+            return Some(ActionRequest::send_group_msg(group_id, normalized));
+        }
+
+        None
+    }
+
     fn reply_to_event(&self, event: &MessageEvent, message: String) -> ActionRequest {
         match event.message_type.as_str() {
             "group" => {
@@ -223,6 +282,13 @@ impl BotRouter {
             _ => ActionRequest::send_private_msg(event.user_id, message),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GroupRepeatState {
+    last_text: Option<String>,
+    muted_text: Option<String>,
+    streak: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -274,6 +340,18 @@ fn keyword_match_with_boundary(text: &str, keyword: &str) -> bool {
     let text_lower = text.to_lowercase();
     let keyword_lower = keyword.to_lowercase();
     match_with_boundary(&text_lower, &keyword_lower)
+}
+
+fn normalize_repeat_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 带 CQ 码的消息（@、图片、回复等）不参与加一，避免误触发和噪音。
+    if trimmed.contains("[CQ:") {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 fn match_with_boundary(text: &str, keyword: &str) -> bool {
