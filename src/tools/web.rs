@@ -1,14 +1,22 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use dashmap::DashMap;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde_json::Value;
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 const DEFAULT_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+const BROWSER_SEC_CH_UA: &str =
+    "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"";
 const MAX_FETCH_CHARS: usize = 5000;
 const MAX_SEARCH_PREVIEW_CHARS: usize = 700;
+const SEARCH_CACHE_TTL_SECS: u64 = 90;
 
 #[derive(Debug, Clone)]
 struct SearchHit {
@@ -18,10 +26,28 @@ struct SearchHit {
     source: &'static str,
 }
 
+#[derive(Clone)]
+struct CachedSearchResult {
+    body: String,
+    cached_at: Instant,
+}
+
+static SEARCH_RESULT_CACHE: OnceLock<DashMap<String, CachedSearchResult>> = OnceLock::new();
+
 pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<String> {
     let query = query.trim();
     if query.is_empty() {
         bail!("query is empty");
+    }
+    let cache_key = search_cache_key(query);
+    if let Some(cached) = load_cached_search_result(&cache_key) {
+        if debug {
+            println!(
+                "[DEBUG] search.cache hit key={} ttl={}s",
+                cache_key, SEARCH_CACHE_TTL_SECS
+            );
+        }
+        return Ok(cached);
     }
 
     if debug {
@@ -196,28 +222,54 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
             debug_log_hits("search.ranked.empty.raw", query, &raw_hits, 10);
         }
 
+        let intent_terms = extract_intent_terms(query);
+        let strict_token = strict_identifier.as_deref();
+        let constrained_hits = take_unique_hits_preserve_order(
+            raw_hits
+                .iter()
+                .filter(|hit| {
+                    if let Some(token) = strict_token {
+                        if !hit_matches_identifier(hit, token) {
+                            return false;
+                        }
+                    }
+                    if !intent_terms.is_empty() && !hit_matches_intent_terms(hit, &intent_terms) {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect(),
+            5,
+        );
+
         if strict_identifier_unresolved {
             if let Some(token) = &strict_identifier {
-                return Ok(format!(
+                let out = format!(
                     "未在 Bing 中国检索到包含标识符 `{token}` 的有效结果。\n建议：\n1) 直接附上目标主页链接\n2) 改搜 `+{token}` 或 `+\"{token}\"`\n3) 检查是否存在大小写/下划线/连字符差异"
-                ));
+                );
+                cache_search_result(&cache_key, &out);
+                return Ok(out);
             }
         }
 
-        let fallback_hits = take_unique_hits_preserve_order(raw_hits, 5);
-        if fallback_hits.is_empty() {
-            return Ok(format!("未检索到可用结果。query={query}"));
+        if constrained_hits.is_empty() {
+            let out = format!(
+                "未在 Bing 中国检索到与 `{query}` 明确相关的结果（当前结果相关性过低，已丢弃）。\n建议：\n1) 给更具体关键词（如地名/平台/全名）\n2) 直接提供目标链接\n3) 用引号精确检索，例如 `\"{query}\"`"
+            );
+            cache_search_result(&cache_key, &out);
+            return Ok(out);
         }
 
         if debug {
             println!(
-                "[DEBUG] search fallback to raw order hits={}",
-                fallback_hits.len()
+                "[DEBUG] search fallback to constrained hits={}",
+                constrained_hits.len()
             );
         }
 
-        let mut out = format!("Web 搜索结果（query: {query}，按原始结果回退）:\n");
-        for (idx, hit) in fallback_hits.iter().enumerate() {
+        let mut out = format!("Web 搜索结果（query: {query}，按关键词强匹配回退）:\n");
+        for (idx, hit) in constrained_hits.iter().enumerate() {
             if hit.snippet.is_empty() {
                 out.push_str(&format!(
                     "{}. [{}] {} - {}\n",
@@ -237,7 +289,9 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
                 ));
             }
         }
-        return Ok(out.trim().to_string());
+        let out = out.trim().to_string();
+        cache_search_result(&cache_key, &out);
+        return Ok(out);
     }
 
     let top_hits: Vec<SearchHit> = ranked.into_iter().take(5).collect();
@@ -306,7 +360,9 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
         out.push_str("\n建议：优先基于“网页核验预览”回答，不足时再 fetch_url 深读。");
     }
 
-    Ok(out.trim().to_string())
+    let out = out.trim().to_string();
+    cache_search_result(&cache_key, &out);
+    Ok(out)
 }
 
 pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String> {
@@ -400,6 +456,43 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     out
 }
 
+fn search_result_cache() -> &'static DashMap<String, CachedSearchResult> {
+    SEARCH_RESULT_CACHE.get_or_init(DashMap::new)
+}
+
+fn search_cache_key(query: &str) -> String {
+    let normalized = normalize_search_query(query);
+    if normalized.is_empty() {
+        query.trim().to_lowercase()
+    } else {
+        normalized.to_lowercase()
+    }
+}
+
+fn load_cached_search_result(cache_key: &str) -> Option<String> {
+    let cache = search_result_cache();
+    if let Some(entry) = cache.get(cache_key) {
+        if entry.cached_at.elapsed() <= Duration::from_secs(SEARCH_CACHE_TTL_SECS) {
+            return Some(entry.body.clone());
+        }
+    }
+    cache.remove(cache_key);
+    None
+}
+
+fn cache_search_result(cache_key: &str, body: &str) {
+    if cache_key.is_empty() || body.is_empty() {
+        return;
+    }
+    search_result_cache().insert(
+        cache_key.to_string(),
+        CachedSearchResult {
+            body: body.to_string(),
+            cached_at: Instant::now(),
+        },
+    );
+}
+
 fn build_search_session_client() -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_secs(20))
@@ -414,6 +507,18 @@ async fn warmup_bing_session(client: &Client, debug: bool) {
         .get(warmup_url)
         .header("User-Agent", DEFAULT_UA)
         .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Sec-CH-UA", BROWSER_SEC_CH_UA)
+        .header("Sec-CH-UA-Mobile", "?0")
+        .header("Sec-CH-UA-Platform", "\"macOS\"")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Upgrade-Insecure-Requests", "1")
         .send()
         .await
     {
@@ -436,24 +541,37 @@ async fn warmup_bing_session(client: &Client, debug: bool) {
 
 fn rewrite_query_for_second_pass(query: &str, _pass1_hits: &[SearchHit]) -> String {
     let normalized = normalize_search_query(query);
-    if normalized.is_empty() {
+    let base = if normalized.is_empty() {
         query.trim().to_string()
     } else {
         normalized
+    };
+
+    if is_identifier_query(&base) {
+        if let Some(token) = extract_identifier_token(&base) {
+            let pass1_has_identifier = _pass1_hits
+                .iter()
+                .any(|hit| hit_matches_identifier(hit, &token));
+            if !pass1_has_identifier {
+                return format!("\"{token}\"");
+            }
+        }
     }
+
+    base
 }
 
 async fn search_bing(client: &Client, query: &str, debug: bool) -> Result<Vec<SearchHit>> {
     let encoded = urlencoding::encode(query);
-    let mut query_params = format!("q={encoded}&setlang=zh-Hans");
+    let mut query_params = format!("q={encoded}&setlang=zh-Hans&cc=CN");
     if prefers_english_search(query) {
-        query_params.push_str("&ensearch=1&mkt=en-US&cc=US");
+        query_params.push_str("&ensearch=1");
     } else {
-        query_params.push_str("&cc=CN&ensearch=0");
+        query_params.push_str("&ensearch=0");
     }
     let search_url = format!("https://cn.bing.com/search?{query_params}");
     let accept_language = if prefers_english_search(query) {
-        "en-US,en;q=0.9,zh-CN;q=0.7"
+        "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
     } else {
         "zh-CN,zh;q=0.9,en;q=0.8"
     };
@@ -466,6 +584,14 @@ async fn search_bing(client: &Client, query: &str, debug: bool) -> Result<Vec<Se
         )
         .header("Accept-Language", accept_language)
         .header("Referer", "https://cn.bing.com/")
+        .header("Sec-CH-UA", BROWSER_SEC_CH_UA)
+        .header("Sec-CH-UA-Mobile", "?0")
+        .header("Sec-CH-UA-Platform", "\"macOS\"")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Sec-Fetch-User", "?1")
+        .header("Upgrade-Insecure-Requests", "1")
         .send()
         .await
         .with_context(|| format!("search request failed: {search_url}"))?;
@@ -1082,6 +1208,7 @@ fn rank_search_hits(
 ) -> Vec<SearchHit> {
     let terms = build_query_terms(query_variants);
     let intent_terms = extract_intent_terms(original_query);
+    let core_terms = extract_core_terms(original_query);
     if hits.is_empty() {
         return Vec::new();
     }
@@ -1094,6 +1221,9 @@ fn rank_search_hits(
             if !hit_matches_identifier(&hit, token) {
                 continue;
             }
+        }
+        if !core_terms.is_empty() && !hit_matches_core_terms(&hit, &core_terms) {
+            continue;
         }
         if !intent_terms.is_empty() && !hit_matches_intent_terms(&hit, &intent_terms) {
             continue;
@@ -1143,34 +1273,47 @@ fn build_query_variants(query: &str) -> Vec<String> {
     } else {
         normalized.as_str()
     };
-    push_plus_variants(&mut variants, base);
     push_query_variant(&mut variants, base);
+    let identifier_mode = is_identifier_query(base);
 
     if let Some(token) = extract_identifier_token(base) {
         push_query_variant(&mut variants, &format!("\"{token}\""));
-        push_plus_variants(&mut variants, &token);
 
         if token.contains('_') {
             let alt = token.replace('_', "-");
             push_query_variant(&mut variants, &alt);
-            push_plus_variants(&mut variants, &alt);
+            push_query_variant(&mut variants, &format!("\"{alt}\""));
         }
         if token.contains('-') {
             let alt = token.replace('-', "_");
             push_query_variant(&mut variants, &alt);
-            push_plus_variants(&mut variants, &alt);
+            push_query_variant(&mut variants, &format!("\"{alt}\""));
+        }
+    }
+
+    if !identifier_mode {
+        if !contains_cjk(base) {
+            push_plus_variants(&mut variants, base);
         }
     }
 
     if normalized != query.trim() {
-        push_plus_variants(&mut variants, &normalized);
         push_query_variant(&mut variants, &normalized);
+        if !identifier_mode {
+            if !contains_cjk(&normalized) {
+                push_plus_variants(&mut variants, &normalized);
+            }
+        }
     }
 
     if query_needs_recency(query) {
         let news_variant = format!("{base} 新闻 最新");
         push_query_variant(&mut variants, &news_variant);
-        push_plus_variants(&mut variants, &news_variant);
+        if !identifier_mode {
+            if !contains_cjk(&news_variant) {
+                push_plus_variants(&mut variants, &news_variant);
+            }
+        }
     }
 
     variants
@@ -1311,6 +1454,16 @@ fn query_needs_recency(query: &str) -> bool {
 
 fn prefers_english_search(query: &str) -> bool {
     !contains_cjk(query) && extract_identifier_token(query).is_some()
+}
+
+fn is_identifier_query(query: &str) -> bool {
+    if contains_cjk(query) {
+        return false;
+    }
+    if query.split_whitespace().count() > 3 {
+        return false;
+    }
+    extract_identifier_token(query).is_some()
 }
 
 fn extract_identifier_token(query: &str) -> Option<String> {
@@ -1477,6 +1630,59 @@ fn extract_intent_terms(query: &str) -> Vec<String> {
     out
 }
 
+fn extract_core_terms(query: &str) -> Vec<String> {
+    let normalized = normalize_search_query(query);
+    let base = if normalized.is_empty() {
+        query
+    } else {
+        normalized.as_str()
+    };
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for term in base.split_whitespace() {
+        let token = term
+            .trim()
+            .trim_matches(|c: char| c == '"' || c == '\'')
+            .trim_start_matches('+')
+            .to_lowercase();
+        if token.chars().count() < 2 {
+            continue;
+        }
+        if is_generic_query_token(&token) {
+            continue;
+        }
+        if seen.insert(token.clone()) {
+            out.push(token.clone());
+        }
+        if contains_cjk(&token) && token.chars().count() >= 4 {
+            for bg in cjk_bigrams(&token) {
+                if seen.insert(bg.clone()) {
+                    out.push(bg);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn hit_matches_core_terms(hit: &SearchHit, core_terms: &[String]) -> bool {
+    if core_terms.is_empty() {
+        return true;
+    }
+    let title = hit.title.to_lowercase();
+    let url = hit.url.to_lowercase();
+    let snippet = hit.snippet.to_lowercase();
+
+    core_terms.iter().any(|term| {
+        title.contains(term.as_str())
+            || url.contains(term.as_str())
+            || (title.is_empty() && snippet.contains(term.as_str()))
+    })
+}
+
 fn hit_matches_intent_terms(hit: &SearchHit, intent_terms: &[String]) -> bool {
     if intent_terms.is_empty() {
         return true;
@@ -1503,6 +1709,8 @@ fn is_generic_query_token(token: &str) -> bool {
             | "有哪些"
             | "推荐"
             | "大全"
+            | "完整"
+            | "全部"
             | "最新"
             | "最近"
             | "新闻"

@@ -35,7 +35,7 @@ use crate::{
     },
     logger::{debug as log_debug, error as log_error, info as log_info, warn as log_warn},
     onebot::action::ActionRequest,
-    onebot::event::{extract_cq_image_refs, MessageEvent},
+    onebot::event::{extract_cq_image_refs, MessageEvent, MessagePayload},
     store::memory::MemoryStore,
 };
 
@@ -446,9 +446,34 @@ async fn enrich_event_images(
     let mut quote_texts = Vec::new();
     let mut seen_quote_texts = HashSet::new();
 
+    // 0) 直接读取 raw_message 里已有的 CQ image url（有些群直接给 url）。
+    for image_ref in extract_cq_image_refs(&event.raw_message) {
+        if let Some(url) = image_ref.url {
+            let url = normalize_image_ref(&url);
+            if looks_like_http_url(&url) && seen.insert(url.clone()) {
+                urls.push(url);
+            }
+        }
+    }
+
+    // 0.1) 结构化 segments 里带 url 的情况。
+    if let MessagePayload::Segments(segments) = &event.message {
+        for segment in segments {
+            if segment.kind != "image" {
+                continue;
+            }
+            if let Some(url) = segment.data.get("url").and_then(Value::as_str) {
+                let url = normalize_image_ref(url);
+                if looks_like_http_url(&url) && seen.insert(url.clone()) {
+                    urls.push(url);
+                }
+            }
+        }
+    }
+
     // 1) 当前消息里的图片 file id -> 尝试 get_image 解析 URL。
     for file_id in event.image_file_ids().into_iter().take(4) {
-        if let Some(url) = resolve_image_url(bridge, &file_id).await {
+        if let Some(url) = resolve_image_url(bridge, &file_id, debug).await {
             if seen.insert(url.clone()) {
                 urls.push(url);
             }
@@ -484,7 +509,7 @@ async fn enrich_event_images(
         }
 
         for file_id in quoted_files.into_iter().take(4) {
-            if let Some(url) = resolve_image_url(bridge, &file_id).await {
+            if let Some(url) = resolve_image_url(bridge, &file_id, debug).await {
                 if seen.insert(url.clone()) {
                     urls.push(url);
                 }
@@ -631,7 +656,11 @@ fn trim_for_context(text: &str, max_chars: usize) -> String {
     chars.into_iter().take(max_chars).collect::<String>() + "...(truncated)"
 }
 
-async fn resolve_image_url(bridge: &WsActionBridge, image_ref: &str) -> Option<String> {
+async fn resolve_image_url(
+    bridge: &WsActionBridge,
+    image_ref: &str,
+    debug: bool,
+) -> Option<String> {
     let value = normalize_image_ref(image_ref);
     if value.is_empty() {
         return None;
@@ -649,7 +678,14 @@ async fn resolve_image_url(bridge: &WsActionBridge, image_ref: &str) -> Option<S
     let response = bridge
         .call_action("get_image", json!({ "file": value }))
         .await
-        .ok()?;
+        .ok();
+    let response = match response {
+        Some(v) => v,
+        None => {
+            log_debug(debug, format!("get_image failed file={image_ref}"));
+            return None;
+        }
+    };
     let data = response.get("data")?;
 
     for key in ["url", "file"] {
@@ -658,9 +694,22 @@ async fn resolve_image_url(bridge: &WsActionBridge, image_ref: &str) -> Option<S
             if looks_like_http_url(&v) || v.starts_with("base64://") || v.starts_with("file://") {
                 return Some(v.to_string());
             }
+            if looks_like_local_path(&v) {
+                return Some(format!("file://{v}"));
+            }
         }
     }
 
+    if debug {
+        log_debug(
+            debug,
+            format!(
+                "get_image unresolved file={} data={}",
+                image_ref,
+                response.get("data").cloned().unwrap_or(Value::Null)
+            ),
+        );
+    }
     None
 }
 
@@ -752,6 +801,10 @@ fn collect_image_refs_from_message_value(
 
 fn looks_like_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
+}
+
+fn looks_like_local_path(value: &str) -> bool {
+    value.starts_with('/') || value.contains(":\\")
 }
 
 fn normalize_image_ref(value: &str) -> String {

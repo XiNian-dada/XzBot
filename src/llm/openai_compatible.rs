@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -27,6 +27,60 @@ pub struct OpenAiCompatibleLlm {
 }
 
 impl OpenAiCompatibleLlm {
+    async fn maybe_continue_if_truncated(
+        &self,
+        session_id: String,
+        prior_messages: &[Value],
+        reply: String,
+        finish_reason: Option<String>,
+    ) -> Result<(String, bool)> {
+        if finish_reason.as_deref() != Some("length") {
+            return Ok((reply, false));
+        }
+        if reply.trim().is_empty() {
+            return Ok((reply, false));
+        }
+
+        if self.debug {
+            println!(
+                "[DEBUG] finish_reason=length, attempting single continuation session={}",
+                session_id
+            );
+        }
+
+        let mut messages = prior_messages.to_vec();
+        messages.push(json!({ "role": "assistant", "content": reply }));
+        messages.push(json!({
+            "role": "system",
+            "content": "上一条回复被截断。请直接续写剩余内容，不要重复已输出部分，也不要重新开头。"
+        }));
+
+        let payload = json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.answer_temperature(),
+            "max_tokens": self.max_tokens,
+            "user": session_id,
+        });
+
+        let value = match self.call_openai(payload).await {
+            Ok(v) => v,
+            Err(err) => {
+                if self.debug {
+                    println!("[DEBUG] continuation call failed: {err:#}");
+                }
+                return Ok((reply, false));
+            }
+        };
+
+        let (continued, _, _, _) = parse_openai_choice(&value)?;
+        let continued = continued.trim();
+        if continued.is_empty() {
+            return Ok((reply, false));
+        }
+
+        Ok((format!("{reply}\n{continued}"), true))
+    }
     pub fn from_config(config: &AiConfig, debug: bool) -> Result<Self> {
         let base = config.base_url.trim_end_matches('/').to_string();
         let endpoint = if base.ends_with("/chat/completions") {
@@ -102,6 +156,7 @@ impl OpenAiCompatibleLlm {
     ) -> Result<String> {
         const MAX_TOOL_ROUNDS: usize = 3;
         let tools = openai_tools_schema();
+        let mut executed_tool_signatures = HashSet::new();
 
         for round in 0..=MAX_TOOL_ROUNDS {
             let stage = if has_openai_tool_results(&messages) {
@@ -150,7 +205,7 @@ impl OpenAiCompatibleLlm {
             });
 
             let value = self.call_openai(payload).await?;
-            let (content, tool_calls, assistant_msg) = parse_openai_choice(&value)?;
+            let (content, tool_calls, assistant_msg, finish_reason) = parse_openai_choice(&value)?;
 
             if tool_calls.is_empty() {
                 if let Some(call) =
@@ -203,7 +258,16 @@ impl OpenAiCompatibleLlm {
                         )
                         .await;
                 }
-                return Ok(reply);
+                let (reply, continued) = self
+                    .maybe_continue_if_truncated(
+                        session_id.clone(),
+                        &messages,
+                        reply,
+                        finish_reason.clone(),
+                    )
+                    .await?;
+                let finish = if continued { None } else { finish_reason };
+                return Ok(append_finish_reason_hint(reply, finish));
             }
 
             if round == MAX_TOOL_ROUNDS {
@@ -220,13 +284,55 @@ impl OpenAiCompatibleLlm {
             }
 
             messages.push(assistant_msg);
+            let mut executed_in_this_round = 0usize;
+            let mut skipped_duplicate = 0usize;
             for call in tool_calls {
+                let signature = tool_call_signature(&call);
+                if !signature.is_empty() && executed_tool_signatures.contains(&signature) {
+                    skipped_duplicate += 1;
+                    if self.debug {
+                        println!(
+                            "[DEBUG] skip duplicate tool call name={} id={} signature={}",
+                            call.name, call.id, signature
+                        );
+                    }
+                    let duplicate_msg = format!(
+                        "duplicate tool call skipped: {}。请基于已有工具结果继续回答，除非用户提供了新的关键词/URL。",
+                        call.name
+                    );
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": wrap_untrusted_tool_output("tool_guard", duplicate_msg)
+                    }));
+                    continue;
+                }
+
+                if !signature.is_empty() {
+                    executed_tool_signatures.insert(signature);
+                }
                 let result = self.execute_tool_call(&call).await;
+                executed_in_this_round += 1;
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.id,
                     "content": result
                 }));
+            }
+
+            if executed_in_this_round == 0 && skipped_duplicate > 0 {
+                if self.debug {
+                    println!(
+                        "[DEBUG] all requested tools are duplicates, force final answer to save tokens"
+                    );
+                }
+                return self
+                    .force_final_answer_without_tools(
+                        session_id,
+                        messages,
+                        "duplicate tool calls only",
+                    )
+                    .await;
             }
         }
 
@@ -256,7 +362,7 @@ impl OpenAiCompatibleLlm {
         });
 
         let value = self.call_openai(payload).await?;
-        let (reply, _, assistant_msg) = parse_openai_choice(&value)?;
+        let (reply, _, assistant_msg, finish_reason) = parse_openai_choice(&value)?;
         let reply = reply.trim().to_string();
 
         if reply.is_empty() {
@@ -277,7 +383,11 @@ impl OpenAiCompatibleLlm {
             );
         }
 
-        Ok(reply)
+        let (reply, continued) = self
+            .maybe_continue_if_truncated(session_id, &messages, reply, finish_reason.clone())
+            .await?;
+        let finish = if continued { None } else { finish_reason };
+        Ok(append_finish_reason_hint(reply, finish))
     }
 
     async fn force_final_answer_without_tools(
@@ -314,7 +424,7 @@ impl OpenAiCompatibleLlm {
         });
 
         let value = self.call_openai(payload).await?;
-        let (reply, _, assistant_msg) = parse_openai_choice(&value)?;
+        let (reply, _, assistant_msg, finish_reason) = parse_openai_choice(&value)?;
         let reply = reply.trim().to_string();
         if reply.is_empty() {
             if self.debug {
@@ -340,7 +450,16 @@ impl OpenAiCompatibleLlm {
             }
             return Ok(temporary_network_reply());
         }
-        Ok(reply)
+        let (reply, continued) = self
+            .maybe_continue_if_truncated(
+                session_id.clone(),
+                &messages,
+                reply,
+                finish_reason.clone(),
+            )
+            .await?;
+        let finish = if continued { None } else { finish_reason };
+        Ok(append_finish_reason_hint(reply, finish))
     }
 
     async fn retry_plain_answer_no_reasoning(
@@ -393,7 +512,7 @@ impl OpenAiCompatibleLlm {
             }
         };
 
-        let (reply, _, assistant_msg) = parse_openai_choice(&value)?;
+        let (reply, _, assistant_msg, finish_reason) = parse_openai_choice(&value)?;
         let reply = reply.trim().to_string();
         if reply.is_empty() {
             if self.debug {
@@ -402,7 +521,11 @@ impl OpenAiCompatibleLlm {
             }
             return Ok(None);
         }
-        Ok(Some(reply))
+        let (reply, continued) = self
+            .maybe_continue_if_truncated(session_id, &messages, reply, finish_reason.clone())
+            .await?;
+        let finish = if continued { None } else { finish_reason };
+        Ok(Some(append_finish_reason_hint(reply, finish)))
     }
 
     fn answer_temperature(&self) -> f32 {
@@ -420,35 +543,66 @@ impl OpenAiCompatibleLlm {
 
     async fn call_openai(&self, payload: Value) -> Result<Value> {
         let payload = apply_default_no_thinking_hints(payload);
-        let mut request = self
-            .client
-            .post(&self.endpoint)
-            .header("Content-Type", "application/json");
+        const MAX_ATTEMPTS: usize = 3;
 
-        if !self.api_key.trim().is_empty() {
-            request = request.bearer_auth(self.api_key.trim());
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut request = self
+                .client
+                .post(&self.endpoint)
+                .header("Content-Type", "application/json");
+
+            if !self.api_key.trim().is_empty() {
+                request = request.bearer_auth(self.api_key.trim());
+            }
+
+            let response = match request.json(&payload).send().await {
+                Ok(v) => v,
+                Err(err) => {
+                    if self.debug {
+                        println!(
+                            "[DEBUG] openai request transport error attempt={}/{} timeout_ms={} err={}",
+                            attempt, MAX_ATTEMPTS, self.timeout_ms, err
+                        );
+                    }
+                    if attempt < MAX_ATTEMPTS && is_retryable_reqwest_error(&err) {
+                        let backoff_ms = 300 * attempt as u64;
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    return Err(err).with_context(|| format!("failed to call {}", self.endpoint));
+                }
+            };
+
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("failed to read AI response body")?;
+
+            if !status.is_success() {
+                if self.debug {
+                    let brief = debug_brief(&body, 240);
+                    println!(
+                        "[DEBUG] openai non-success status attempt={}/{} status={} body={}",
+                        attempt, MAX_ATTEMPTS, status, brief
+                    );
+                }
+
+                if attempt < MAX_ATTEMPTS && (status.is_server_error() || status.as_u16() == 429) {
+                    let backoff_ms = 300 * attempt as u64;
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                bail!("AI endpoint returned {}: {}", status, body);
+            }
+
+            let value: Value = serde_json::from_str(&body)
+                .context("failed to parse chat completion response JSON")?;
+            record_usage_from_openai_response(&value, self.debug);
+            return Ok(value);
         }
 
-        let response = request
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| format!("failed to call {}", self.endpoint))?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("failed to read AI response body")?;
-
-        if !status.is_success() {
-            bail!("AI endpoint returned {}: {}", status, body);
-        }
-
-        let value: Value =
-            serde_json::from_str(&body).context("failed to parse chat completion response JSON")?;
-        record_usage_from_openai_response(&value, self.debug);
-        Ok(value)
+        bail!("failed to call {} after retries", self.endpoint)
     }
 
     async fn build_request_messages(&self, messages: &[(String, String)]) -> Result<Vec<Value>> {
@@ -555,6 +709,14 @@ impl OpenAiCompatibleLlm {
             }
         }
 
+        if self.debug {
+            println!(
+                "[DEBUG] image payload for llm refs={} attached={}",
+                image_refs.len(),
+                image_count
+            );
+        }
+
         if image_count == 0 {
             blocks.push(json!({
                 "type": "text",
@@ -637,12 +799,18 @@ struct OpenAiToolCall {
     arguments: Value,
 }
 
-fn parse_openai_choice(value: &Value) -> Result<(String, Vec<OpenAiToolCall>, Value)> {
+fn parse_openai_choice(
+    value: &Value,
+) -> Result<(String, Vec<OpenAiToolCall>, Value, Option<String>)> {
     let choices = value
         .get("choices")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("missing field: choices"))?;
     let first = choices.first().ok_or_else(|| anyhow!("choices is empty"))?;
+    let finish_reason = first
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .map(|v| v.to_string());
     let message = if let Some(msg) = first.get("message").cloned() {
         msg
     } else {
@@ -656,7 +824,7 @@ fn parse_openai_choice(value: &Value) -> Result<(String, Vec<OpenAiToolCall>, Va
     let content = message_content_as_text(&message);
     let calls = parse_tool_calls_from_message(&message);
 
-    Ok((content, calls, message))
+    Ok((content, calls, message, finish_reason))
 }
 
 fn has_openai_tool_results(messages: &[Value]) -> bool {
@@ -1134,6 +1302,23 @@ fn temporary_network_reply() -> String {
     "网不太好，我这边请求超时了，等会再试试。".to_string()
 }
 
+fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_body() || err.is_request()
+}
+
+fn debug_brief(input: &str, max_chars: usize) -> String {
+    let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for (idx, ch) in normalized.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...(truncated)");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn build_synthetic_assistant_tool_message(call: &OpenAiToolCall, content: &str) -> Value {
     json!({
         "role": "assistant",
@@ -1160,6 +1345,94 @@ fn extract_argument_str(arguments: &Value, keys: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn tool_call_signature(call: &OpenAiToolCall) -> String {
+    match call.name.as_str() {
+        "search_web" => {
+            let query = extract_argument_str(&call.arguments, &["query", "q", "keyword"])
+                .or_else(|| {
+                    call.arguments
+                        .get("raw")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let normalized = normalize_tool_text(&query);
+            if normalized.is_empty() {
+                String::new()
+            } else {
+                format!("search_web:{normalized}")
+            }
+        }
+        "fetch_url" => {
+            let url = extract_argument_str(&call.arguments, &["url", "link", "href"])
+                .or_else(|| {
+                    call.arguments
+                        .get("raw")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let normalized = normalize_tool_url(&url);
+            if normalized.is_empty() {
+                String::new()
+            } else {
+                format!("fetch_url:{normalized}")
+            }
+        }
+        "get_weather" => {
+            let location =
+                extract_argument_str(&call.arguments, &["location", "city", "place", "query"])
+                    .unwrap_or_default();
+            let normalized = normalize_tool_text(&location);
+            if normalized.is_empty() {
+                String::new()
+            } else {
+                format!("get_weather:{normalized}")
+            }
+        }
+        "get_system_info" => {
+            let scope =
+                extract_argument_str(&call.arguments, &["scope", "type"]).unwrap_or_default();
+            let normalized = normalize_tool_text(&scope);
+            if normalized.is_empty() {
+                "get_system_info:all".to_string()
+            } else {
+                format!("get_system_info:{normalized}")
+            }
+        }
+        _ => {
+            let args = call.arguments.to_string();
+            format!("{}:{}", call.name, normalize_tool_text(&args))
+        }
+    }
+}
+
+fn normalize_tool_text(raw: &str) -> String {
+    strip_sender_prefix(raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn normalize_tool_url(raw: &str) -> String {
+    raw.trim()
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+        .to_lowercase()
+}
+
+fn append_finish_reason_hint(reply: String, finish_reason: Option<String>) -> String {
+    if reply.is_empty() {
+        return reply;
+    }
+    let reason = finish_reason.unwrap_or_default();
+    if reason == "length" {
+        return format!("{reply}\n（回答可能被截断，可回复“继续”。）");
+    }
+    reply
 }
 
 fn truncate_debug_json(value: &Value) -> String {

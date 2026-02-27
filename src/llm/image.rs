@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
+use serde_json::Value;
 use tokio::fs;
 
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
@@ -45,9 +46,20 @@ async fn fetch_image_by_url(client: &Client, url: &str, debug: bool) -> Result<I
         println!("[DEBUG] fetch image for llm url={url}");
     }
 
-    let response = client
+    let mut request = client
         .get(url)
         .header("User-Agent", DEFAULT_UA)
+        .header(
+            "Accept",
+            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        )
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+    if url.contains("multimedia.nt.qq.com.cn") {
+        request = request
+            .header("Referer", "https://im.qq.com/")
+            .header("Origin", "https://im.qq.com");
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("failed to fetch image: {url}"))?;
@@ -78,6 +90,41 @@ async fn fetch_image_by_url(client: &Client, url: &str, debug: bool) -> Result<I
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
+    let image_magic = has_supported_image_magic(&bytes);
+    if debug {
+        println!(
+            "[DEBUG] image fetch status={} content_type={} bytes={} magic={}",
+            status,
+            content_type,
+            bytes.len(),
+            image_magic
+        );
+    }
+
+    if is_json_or_text_content_type(&content_type)
+        || (!image_magic && !content_type.starts_with("image/"))
+    {
+        if let Some(api_err) = extract_remote_image_error(&bytes) {
+            bail!("image endpoint returned non-image payload: {api_err}");
+        }
+        let preview = String::from_utf8_lossy(&bytes);
+        let preview = preview
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(160)
+            .collect::<String>();
+        bail!("image endpoint returned non-image payload: {preview}");
+    }
+
+    if !content_type.starts_with("image/") && !image_magic {
+        bail!(
+            "image endpoint returned unknown binary payload (content-type={})",
+            content_type
+        );
+    }
+
     let media_type = normalize_media_type(&content_type, url, &bytes);
     Ok(ImageBinary {
         media_type,
@@ -204,6 +251,55 @@ fn is_supported_media_type(value: &str) -> bool {
         value,
         "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp"
     )
+}
+
+fn has_supported_image_magic(bytes: &[u8]) -> bool {
+    if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
+        return true;
+    }
+    if bytes.len() >= 8
+        && bytes[0] == 0x89
+        && bytes[1] == b'P'
+        && bytes[2] == b'N'
+        && bytes[3] == b'G'
+    {
+        return true;
+    }
+    if bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+        return true;
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return true;
+    }
+    false
+}
+
+fn is_json_or_text_content_type(content_type: &str) -> bool {
+    content_type.contains("application/json")
+        || content_type.contains("application/problem+json")
+        || content_type.starts_with("text/")
+}
+
+fn extract_remote_image_error(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(text).ok()?;
+    let retmsg = value
+        .get("retmsg")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let retcode = value
+        .get("retcode")
+        .and_then(Value::as_i64)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    if retmsg.is_empty() && retcode.is_empty() {
+        return None;
+    }
+    Some(format!("retcode={} retmsg={}", retcode, retmsg))
 }
 
 fn normalize_image_ref(value: &str) -> String {
