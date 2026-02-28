@@ -14,6 +14,8 @@ const DEFAULT_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 const BROWSER_SEC_CH_UA: &str =
     "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"";
+use crate::config::{SearchConfig, SearchProvider};
+
 const MAX_FETCH_CHARS: usize = 5000;
 const MAX_SEARCH_PREVIEW_CHARS: usize = 700;
 const SEARCH_CACHE_TTL_SECS: u64 = 90;
@@ -34,12 +36,17 @@ struct CachedSearchResult {
 
 static SEARCH_RESULT_CACHE: OnceLock<DashMap<String, CachedSearchResult>> = OnceLock::new();
 
-pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<String> {
+pub async fn search_web(
+    client: &Client,
+    query: &str,
+    debug: bool,
+    search: &SearchConfig,
+) -> Result<String> {
     let query = query.trim();
     if query.is_empty() {
         bail!("query is empty");
     }
-    let cache_key = search_cache_key(query);
+    let cache_key = search_cache_key_with_provider(query, search);
     if let Some(cached) = load_cached_search_result(&cache_key) {
         if debug {
             println!(
@@ -51,7 +58,15 @@ pub async fn search_web(client: &Client, query: &str, debug: bool) -> Result<Str
     }
 
     if debug {
-        println!("[DEBUG] tool.search_web query={query}");
+        println!(
+            "[DEBUG] tool.search_web query={} provider={}",
+            query,
+            search.provider.as_str()
+        );
+    }
+
+    if search.provider == SearchProvider::Searxng {
+        return search_web_searxng(client, query, debug, search, &cache_key).await;
     }
 
     let search_client = match build_search_session_client() {
@@ -460,12 +475,23 @@ fn search_result_cache() -> &'static DashMap<String, CachedSearchResult> {
     SEARCH_RESULT_CACHE.get_or_init(DashMap::new)
 }
 
-fn search_cache_key(query: &str) -> String {
+fn search_cache_key_query(query: &str) -> String {
     let normalized = normalize_search_query(query);
     if normalized.is_empty() {
         query.trim().to_lowercase()
     } else {
         normalized.to_lowercase()
+    }
+}
+
+fn search_cache_key_with_provider(query: &str, search: &SearchConfig) -> String {
+    let base = search_cache_key_query(query);
+    match search.provider {
+        SearchProvider::Builtin => format!("builtin:{base}"),
+        SearchProvider::Searxng => {
+            let host = normalize_searxng_cache_key(&search.searxng_url);
+            format!("searxng:{host}:{base}")
+        }
     }
 }
 
@@ -537,6 +563,132 @@ async fn warmup_bing_session(client: &Client, debug: bool) {
             }
         }
     }
+}
+
+async fn search_web_searxng(
+    client: &Client,
+    query: &str,
+    debug: bool,
+    search: &SearchConfig,
+    cache_key: &str,
+) -> Result<String> {
+    let normalized = normalize_search_query(query);
+    let q = if normalized.is_empty() {
+        query.trim()
+    } else {
+        normalized.as_str()
+    };
+
+    let hits = search_searxng(client, &search.searxng_url, q, debug).await?;
+    if debug {
+        println!("[DEBUG] search.searxng raw_hits={}", hits.len());
+        debug_log_hits("search.searxng", q, &hits, 8);
+    }
+
+    let variants = build_query_variants(q);
+    let strict_identifier =
+        extract_identifier_token(q).filter(|token| should_enable_identifier_filter(q, token));
+    let mut ranked = rank_search_hits(q, &variants, hits.clone(), strict_identifier.as_deref());
+    if ranked.is_empty() && strict_identifier.is_some() {
+        ranked = rank_search_hits(q, &variants, hits.clone(), None);
+    }
+
+    if ranked.is_empty() {
+        let intent_terms = extract_intent_terms(q);
+        let strict_token = strict_identifier.as_deref();
+        let constrained_hits = take_unique_hits_preserve_order(
+            hits.iter()
+                .filter(|hit| {
+                    if let Some(token) = strict_token {
+                        if !hit_matches_identifier(hit, token) {
+                            return false;
+                        }
+                    }
+                    if !intent_terms.is_empty() && !hit_matches_intent_terms(hit, &intent_terms) {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect(),
+            5,
+        );
+
+        if strict_identifier.is_some() && constrained_hits.is_empty() {
+            if let Some(token) = strict_identifier {
+                let out = format!(
+                    "未在 SearXNG 检索到包含标识符 `{token}` 的有效结果。\n建议：\n1) 直接附上目标主页链接\n2) 用引号精确检索，例如 `\"{token}\"`\n3) 检查是否存在大小写/下划线/连字符差异"
+                );
+                cache_search_result(cache_key, &out);
+                return Ok(out);
+            }
+        }
+
+        if constrained_hits.is_empty() {
+            let out = format!(
+                "未在 SearXNG 检索到与 `{q}` 明确相关的结果（当前结果相关性过低，已丢弃）。\n建议：\n1) 给更具体关键词（如地名/平台/全名）\n2) 直接提供目标链接\n3) 用引号精确检索，例如 `\"{q}\"`"
+            );
+            cache_search_result(cache_key, &out);
+            return Ok(out);
+        }
+
+        let mut out =
+            format!("Web 搜索结果（provider: searxng, query: {q}，按关键词强匹配回退）:\n");
+        for (idx, hit) in constrained_hits.iter().enumerate() {
+            if hit.snippet.is_empty() {
+                out.push_str(&format!(
+                    "{}. [{}] {} - {}\n",
+                    idx + 1,
+                    hit.source,
+                    hit.title,
+                    hit.url
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{}. [{}] {} - {} - {}\n",
+                    idx + 1,
+                    hit.source,
+                    hit.title,
+                    hit.url,
+                    hit.snippet
+                ));
+            }
+        }
+        let out = out.trim().to_string();
+        cache_search_result(cache_key, &out);
+        return Ok(out);
+    }
+
+    let top_hits: Vec<SearchHit> = ranked.into_iter().take(5).collect();
+    let mut out = format!("Web 搜索结果（provider: searxng, query: {q}）:\n");
+    for (idx, hit) in top_hits.iter().enumerate() {
+        if hit.snippet.is_empty() {
+            out.push_str(&format!(
+                "{}. [{}] {} - {}\n",
+                idx + 1,
+                hit.source,
+                hit.title,
+                hit.url
+            ));
+        } else {
+            out.push_str(&format!(
+                "{}. [{}] {} - {} - {}\n",
+                idx + 1,
+                hit.source,
+                hit.title,
+                hit.url,
+                hit.snippet
+            ));
+        }
+    }
+
+    let out = out.trim().to_string();
+    cache_search_result(cache_key, &out);
+    Ok(out)
+}
+
+fn normalize_searxng_cache_key(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_lowercase()
 }
 
 fn rewrite_query_for_second_pass(query: &str, _pass1_hits: &[SearchHit]) -> String {
@@ -615,6 +767,89 @@ async fn search_bing(client: &Client, query: &str, debug: bool) -> Result<Vec<Se
         debug_log_hits("search.bing", query, &hits, 8);
     }
     Ok(hits)
+}
+
+async fn search_searxng(
+    client: &Client,
+    base_url: &str,
+    query: &str,
+    debug: bool,
+) -> Result<Vec<SearchHit>> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        bail!("searxng_url is empty");
+    }
+    let encoded = urlencoding::encode(query);
+    let search_url =
+        format!("{base}/search?q={encoded}&format=json&language=zh-CN&categories=general");
+
+    let response = client
+        .get(&search_url)
+        .header("User-Agent", DEFAULT_UA)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .with_context(|| format!("searxng request failed: {search_url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read searxng response body")?;
+
+    if !status.is_success() {
+        bail!("searxng endpoint returned {status}: {body}");
+    }
+
+    let value: Value =
+        serde_json::from_str(&body).context("failed to parse searxng response JSON")?;
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for item in results.into_iter().take(12) {
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let url = item
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        let snippet = item
+            .get("content")
+            .or_else(|| item.get("snippet"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        out.push(SearchHit {
+            title,
+            url,
+            snippet,
+            source: "searxng",
+        });
+    }
+
+    if debug {
+        println!(
+            "[DEBUG] search.searxng query={} url={} hits={}",
+            query,
+            search_url,
+            out.len()
+        );
+    }
+
+    Ok(out)
 }
 
 #[allow(dead_code)]

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::{
-    config::AiConfig,
+    config::{AiConfig, SearchConfig},
     llm::Llm,
     llm::{
         image::load_image_for_llm,
@@ -26,10 +26,11 @@ pub struct AnthropicCompatibleLlm {
     max_tokens: u32,
     temperature: f32,
     debug: bool,
+    search: SearchConfig,
 }
 
 impl AnthropicCompatibleLlm {
-    pub fn from_config(config: &AiConfig, debug: bool) -> Result<Self> {
+    pub fn from_config(config: &AiConfig, search: &SearchConfig, debug: bool) -> Result<Self> {
         let base = config.base_url.trim_end_matches('/').to_string();
         let endpoint = if base.ends_with("/messages") {
             base
@@ -51,6 +52,7 @@ impl AnthropicCompatibleLlm {
             max_tokens: config.max_tokens,
             temperature: config.temperature,
             debug,
+            search: search.clone(),
         })
     }
 }
@@ -345,7 +347,7 @@ impl AnthropicCompatibleLlm {
                 if query.is_empty() {
                     return "search_web error: query is empty".to_string();
                 }
-                match search_web(&self.client, &query, self.debug).await {
+                match search_web(&self.client, &query, self.debug, &self.search).await {
                     Ok(v) => wrap_untrusted_tool_output("search_web", v),
                     Err(err) => format!("search_web error: {err}"),
                 }

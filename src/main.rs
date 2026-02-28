@@ -160,12 +160,19 @@ async fn main() -> anyhow::Result<()> {
 
 fn build_runtime(config: Arc<Config>, store: Arc<MemoryStore>) -> anyhow::Result<RuntimeState> {
     let llm: Arc<dyn Llm> = match config.ai.provider {
-        AiProvider::Mock => Arc::new(MockLlm::new(config.debug, config.ai.timeout_ms)?),
-        AiProvider::OpenaiCompatible => {
-            Arc::new(OpenAiCompatibleLlm::from_config(&config.ai, config.debug)?)
-        }
+        AiProvider::Mock => Arc::new(MockLlm::new(
+            config.debug,
+            config.ai.timeout_ms,
+            config.search.clone(),
+        )?),
+        AiProvider::OpenaiCompatible => Arc::new(OpenAiCompatibleLlm::from_config(
+            &config.ai,
+            &config.search,
+            config.debug,
+        )?),
         AiProvider::AnthropicCompatible => Arc::new(AnthropicCompatibleLlm::from_config(
             &config.ai,
+            &config.search,
             config.debug,
         )?),
     };

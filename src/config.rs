@@ -15,6 +15,8 @@ pub struct Config {
     pub group: GroupConfig,
     pub persona: PersonaConfig,
     pub ai: AiConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 impl Config {
@@ -92,6 +94,16 @@ impl Config {
             && self.ai.anthropic_version.trim().is_empty()
         {
             bail!("ai.anthropic_version cannot be empty for anthropic_compatible");
+        }
+        if self.search.provider == SearchProvider::Searxng {
+            if self.search.searxng_url.trim().is_empty() {
+                bail!("search.searxng_url cannot be empty when search.provider = \"searxng\"");
+            }
+            if !self.search.searxng_url.starts_with("http://")
+                && !self.search.searxng_url.starts_with("https://")
+            {
+                bail!("search.searxng_url must start with http:// or https://");
+            }
         }
         if self.group.trigger_mode == TriggerMode::Prefix && self.group.prefixes.is_empty() {
             bail!("group.prefixes cannot be empty when trigger_mode = \"prefix\"");
@@ -217,6 +229,39 @@ pub struct AiConfig {
     pub anthropic_version: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchConfig {
+    #[serde(default = "default_search_provider")]
+    pub provider: SearchProvider,
+    #[serde(default)]
+    pub searxng_url: String,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_search_provider(),
+            searxng_url: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchProvider {
+    Builtin,
+    Searxng,
+}
+
+impl SearchProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Searxng => "searxng",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AiProvider {
@@ -245,4 +290,8 @@ fn default_trigger_mode() -> TriggerMode {
 
 fn default_anthropic_version() -> String {
     "2023-06-01".to_string()
+}
+
+fn default_search_provider() -> SearchProvider {
+    SearchProvider::Builtin
 }

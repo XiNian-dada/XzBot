@@ -111,6 +111,16 @@ system = """
 回答要简洁、直接、可执行。
 """
 
+[search]
+# 搜索引擎：
+# - "builtin" : 使用内置 Bing 中国搜索
+# - "searxng" : 使用自建 SearXNG（启用后不再使用其他搜索引擎）
+provider = "builtin"
+
+# SearXNG 服务器地址（provider = "searxng" 时必须填写）
+# 例如 "https://searxng.example.com"
+searxng_url = ""
+
 [ai]
 # LLM 提供方：
 # - "mock"               : 本地 mock，返回 AI Reply: xxx（不调用外网）

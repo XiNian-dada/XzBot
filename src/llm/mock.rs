@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::{
+    config::SearchConfig,
     llm::Llm,
     tools::system::get_system_info,
     tools::web::{extract_urls, fetch_url, search_web},
@@ -12,15 +13,20 @@ use crate::{
 pub struct MockLlm {
     client: reqwest::Client,
     debug: bool,
+    search: SearchConfig,
 }
 
 impl MockLlm {
-    pub fn new(debug: bool, timeout_ms: u64) -> Result<Self> {
+    pub fn new(debug: bool, timeout_ms: u64, search: SearchConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .context("failed to build HTTP client for MockLlm")?;
-        Ok(Self { client, debug })
+        Ok(Self {
+            client,
+            debug,
+            search,
+        })
     }
 }
 
@@ -52,7 +58,7 @@ impl Llm for MockLlm {
         }
 
         if should_search(&last_user_message) {
-            match search_web(&self.client, &last_user_message, self.debug).await {
+            match search_web(&self.client, &last_user_message, self.debug, &self.search).await {
                 Ok(v) => extras.push(format!("[search_web]\n{v}")),
                 Err(err) => extras.push(format!("[search_web error] {err}")),
             }
