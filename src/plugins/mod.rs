@@ -85,6 +85,10 @@ impl PluginManager {
         self.plugins.len()
     }
 
+    pub fn plugin_names(&self) -> Vec<String> {
+        self.plugins.iter().map(|p| p.name.clone()).collect()
+    }
+
     pub async fn shutdown(&self) {
         for plugin in &self.plugins {
             plugin.shutdown(self.config.debug).await;

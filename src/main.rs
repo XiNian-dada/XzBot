@@ -395,6 +395,7 @@ async fn process_incoming(
 struct ReloadOutcome {
     config: Arc<Config>,
     server_rebind_required: bool,
+    plugin_names: Vec<String>,
 }
 
 async fn try_reload_config_command(
@@ -408,16 +409,27 @@ async fn try_reload_config_command(
 
     match reload_runtime(state).await {
         Ok(outcome) => {
+            let plugin_summary = format!(
+                "plugins({}): {}",
+                outcome.plugin_names.len(),
+                if outcome.plugin_names.is_empty() {
+                    "-".to_string()
+                } else {
+                    outcome.plugin_names.join(", ")
+                }
+            );
             log_info(format!(
-                "config reloaded: provider={} model={}",
+                "config reloaded: provider={} model={} {}",
                 outcome.config.ai.provider.as_str(),
-                outcome.config.ai.model
+                outcome.config.ai.model,
+                plugin_summary
             ));
 
             let mut msg = format!(
-                "配置已重载。provider={} model={}",
+                "配置已重载。provider={} model={} {}",
                 outcome.config.ai.provider.as_str(),
-                outcome.config.ai.model
+                outcome.config.ai.model,
+                plugin_summary
             );
             if outcome.server_rebind_required {
                 msg.push_str(
@@ -473,6 +485,7 @@ async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
     let new_config = Arc::new(Config::load(config_path)?);
     let plugin_root = std::env::current_dir()?.join("Plugins");
     let plugins = PluginManager::load_from_dir(&plugin_root, new_config.clone())?;
+    let plugin_names = plugins.plugin_names();
     let new_runtime = build_runtime(new_config.clone(), state.store.clone(), plugins)?;
 
     let mut runtime = state.runtime.write().await;
@@ -490,6 +503,7 @@ async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
     Ok(ReloadOutcome {
         config: new_config,
         server_rebind_required,
+        plugin_names,
     })
 }
 
