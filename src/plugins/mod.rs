@@ -1,13 +1,21 @@
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use crate::{
     config::Config,
@@ -16,16 +24,17 @@ use crate::{
 };
 
 const DEFAULT_PLUGIN_TIMEOUT_MS: u64 = 15_000;
+const MANIFEST_ARG: &str = "--manifest";
 
 #[derive(Debug, Clone)]
 pub struct PluginManager {
-    plugins: Vec<ExternalPlugin>,
+    plugins: Vec<ManagedPlugin>,
     command_map: HashMap<String, usize>,
-    config: std::sync::Arc<Config>,
+    config: Arc<Config>,
 }
 
 impl PluginManager {
-    pub fn load_from_dir(root: &Path, config: std::sync::Arc<Config>) -> Result<Self> {
+    pub fn load_from_dir(root: &Path, config: Arc<Config>) -> Result<Self> {
         if !root.exists() {
             fs::create_dir_all(root)
                 .with_context(|| format!("failed to create plugin dir {}", root.display()))?;
@@ -39,18 +48,25 @@ impl PluginManager {
         {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_dir() {
+            if !path.is_file() {
                 continue;
             }
-            let manifest_path = path.join("plugin.toml");
-            if !manifest_path.exists() {
+            if path.extension() == Some(OsStr::new("toml")) {
                 continue;
             }
-            let manifest_str = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-            let manifest: PluginManifest = toml::from_str(&manifest_str)
-                .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-            let plugin = ExternalPlugin::from_manifest(path.clone(), manifest)?;
+
+            let file_stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("plugin")
+                .to_string();
+            let manifest = read_plugin_manifest(&path).unwrap_or(PluginManifestInfo {
+                name: file_stem.clone(),
+                commands: vec![file_stem.clone()],
+                timeout_ms: None,
+            });
+            let plugin = ManagedPlugin::new(path.clone(), manifest, root)?;
+
             let idx = plugins.len();
             for command in &plugin.commands {
                 command_map.insert(command.to_lowercase(), idx);
@@ -93,6 +109,7 @@ impl PluginManager {
         let plugin = &self.plugins[idx];
 
         let req = PluginRequest {
+            request_id: plugin.next_request_id(),
             command: cmd,
             args,
             raw_text: normalized,
@@ -103,7 +120,7 @@ impl PluginManager {
             config_dir: plugin.config_dir.to_string_lossy().to_string(),
         };
 
-        let reply = plugin.run(req, self.config.debug).await?;
+        let reply = plugin.call(req, self.config.debug).await?;
         if reply.reply.trim().is_empty() {
             return Ok(None);
         }
@@ -130,9 +147,8 @@ impl PluginManager {
 }
 
 #[derive(Debug, Deserialize)]
-struct PluginManifest {
+struct PluginManifestInfo {
     name: String,
-    entry: String,
     #[serde(default)]
     commands: Vec<String>,
     #[serde(default)]
@@ -140,103 +156,176 @@ struct PluginManifest {
 }
 
 #[derive(Debug, Clone)]
-struct ExternalPlugin {
+struct ManagedPlugin {
     name: String,
-    entry: PathBuf,
+    path: PathBuf,
     commands: Vec<String>,
     timeout_ms: u64,
-    dir: PathBuf,
     config_dir: PathBuf,
+    process: Arc<Mutex<Option<PluginProcess>>>,
+    seq: Arc<AtomicU64>,
 }
 
-impl ExternalPlugin {
-    fn from_manifest(dir: PathBuf, manifest: PluginManifest) -> Result<Self> {
-        let entry = dir.join(manifest.entry);
-        if !entry.exists() {
-            return Err(anyhow!("plugin entry not found: {}", entry.display()));
-        }
+impl ManagedPlugin {
+    fn new(path: PathBuf, manifest: PluginManifestInfo, root: &Path) -> Result<Self> {
+        let name = manifest.name.trim().to_string();
         let commands = manifest
             .commands
             .into_iter()
             .map(|c| c.trim().trim_start_matches('/').to_string())
             .filter(|c| !c.is_empty())
             .collect::<Vec<_>>();
-        let config_dir = dir.join("config");
+        let commands = if commands.is_empty() {
+            vec![name.clone()]
+        } else {
+            commands
+        };
+        let timeout_ms = manifest.timeout_ms.unwrap_or(DEFAULT_PLUGIN_TIMEOUT_MS);
+        let config_dir = root.join(&name);
         if !config_dir.exists() {
-            fs::create_dir_all(&config_dir).with_context(|| {
-                format!("failed to create plugin config dir {}", config_dir.display())
-            })?;
+            fs::create_dir_all(&config_dir)
+                .with_context(|| format!("failed to create plugin dir {}", config_dir.display()))?;
         }
+
         Ok(Self {
-            name: manifest.name,
-            entry,
+            name,
+            path,
             commands,
-            timeout_ms: manifest.timeout_ms.unwrap_or(DEFAULT_PLUGIN_TIMEOUT_MS),
-            dir,
+            timeout_ms,
             config_dir,
+            process: Arc::new(Mutex::new(None)),
+            seq: Arc::new(AtomicU64::new(1)),
         })
     }
 
-    async fn run(&self, request: PluginRequest, debug: bool) -> Result<PluginResponse> {
+    fn next_request_id(&self) -> String {
+        format!("{}-{}", self.name, self.seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    async fn call(&self, request: PluginRequest, debug: bool) -> Result<PluginResponse> {
+        let mut guard = self.process.lock().await;
+        let process = ensure_process(&self.path, guard.take(), debug).await?;
+        let mut process = process;
+
         let payload =
-            serde_json::to_vec(&request).context("failed to serialize plugin request")?;
-        let mut child = Command::new(&self.entry)
-            .current_dir(&self.dir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to spawn plugin {}", self.name))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&payload)
-                .await
-                .context("failed to write plugin stdin")?;
-        }
-
-        let output = timeout(Duration::from_millis(self.timeout_ms), child.wait_with_output())
+            serde_json::to_string(&request).context("failed to serialize plugin request")?;
+        let payload = format!("{payload}\n");
+        process
+            .stdin
+            .write_all(payload.as_bytes())
             .await
-            .map_err(|_| anyhow::anyhow!("plugin timeout after {} ms", self.timeout_ms))?
-            .context("failed to read plugin output")?;
+            .context("failed to write plugin stdin")?;
+        process
+            .stdin
+            .flush()
+            .await
+            .context("failed to flush plugin stdin")?;
 
-        if debug {
-            log_debug(
-                debug,
-                format!(
-                    "plugin {} exit={} stderr={}",
-                    self.name,
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            );
-        }
+        let response = read_response(
+            &mut process.stdout,
+            &request.request_id,
+            self.timeout_ms,
+        )
+        .await;
 
-        if !output.status.success() {
-            return Err(anyhow!("plugin {} exited with status {}", self.name, output.status));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if stdout.is_empty() {
-            return Ok(PluginResponse {
-                reply: String::new(),
-                mention_sender: None,
-            });
-        }
-
-        if let Ok(parsed) = serde_json::from_str::<PluginResponse>(&stdout) {
-            return Ok(parsed);
-        }
-
-        Ok(PluginResponse {
-            reply: stdout,
-            mention_sender: None,
-        })
+        *guard = Some(process);
+        response
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug)]
+struct PluginProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+async fn ensure_process(
+    path: &Path,
+    mut existing: Option<PluginProcess>,
+    debug: bool,
+) -> Result<PluginProcess> {
+    if let Some(mut proc) = existing.take() {
+        if let Ok(Some(status)) = proc.child.try_wait() {
+            if debug {
+                log_debug(
+                    debug,
+                    format!("plugin exited status={}, restarting", status),
+                );
+            }
+        } else {
+            return Ok(proc);
+        }
+    }
+
+    let mut child = Command::new(path)
+        .current_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn plugin {}", path.display()))?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture plugin stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture plugin stdout"))?;
+
+    Ok(PluginProcess {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout),
+    })
+}
+
+async fn read_response(
+    stdout: &mut BufReader<ChildStdout>,
+    request_id: &str,
+    timeout_ms: u64,
+) -> Result<PluginResponse> {
+    let mut line = String::new();
+    let fut = async {
+        loop {
+            line.clear();
+            let read = stdout.read_line(&mut line).await?;
+            if read == 0 {
+                return Err(anyhow!("plugin closed stdout"));
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(resp) = serde_json::from_str::<PluginResponse>(trimmed) {
+                if resp
+                    .request_id
+                    .as_deref()
+                    .map(|v| v == request_id)
+                    .unwrap_or(true)
+                {
+                    return Ok(resp);
+                }
+                continue;
+            }
+            return Ok(PluginResponse {
+                request_id: None,
+                reply: trimmed.to_string(),
+                mention_sender: None,
+            });
+        }
+    };
+
+    timeout(Duration::from_millis(timeout_ms), fut)
+        .await
+        .map_err(|_| anyhow!("plugin timeout after {} ms", timeout_ms))?
+}
+
+#[derive(Debug, Serialize)]
 struct PluginRequest {
+    request_id: String,
     command: String,
     args: String,
     raw_text: String,
@@ -247,11 +336,25 @@ struct PluginRequest {
     config_dir: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 struct PluginResponse {
+    #[serde(default)]
+    request_id: Option<String>,
     reply: String,
     #[serde(default)]
     mention_sender: Option<bool>,
+}
+
+fn read_plugin_manifest(path: &Path) -> Option<PluginManifestInfo> {
+    let output = std::process::Command::new(path)
+        .arg(MANIFEST_ARG)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim()).ok()
 }
 
 fn parse_command(text: &str) -> Option<(String, String)> {

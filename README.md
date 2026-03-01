@@ -105,53 +105,32 @@ proxy_timeout_ms = 5000
 | `/blacklist add <group_id>` | 添加群到黑名单 |
 | `/blacklist remove <group_id>` | 从黑名单移除群 |
 
-## 插件（外部进程）
+## 插件（托管进程）
 
-运行时会在 **当前工作目录** 创建 `Plugins/` 文件夹。  
-每个插件一个子目录，结构类似 MC 服务器插件：
+XzBot 启动时会在 **当前工作目录** 创建 `Plugins/` 文件夹，并扫描其中的可执行文件。  
+插件进程由 XzBot **统一拉起并常驻管理**（类似 MC/Spigot 插件生命周期）。
 
 ```
 Plugins/
-└── fuck-u-code/
-    ├── plugin.toml
-    ├── config/
-    └── bin/
-        └── fuck-u-code-plugin   # 你的插件可执行文件
+├── my-plugin            # 插件二进制
+└── my-plugin/           # 插件自己使用的目录（配置/缓存）
 ```
 
-`plugin.toml` 示例：
+插件需支持：
 
-```toml
-name = "fuck-u-code"
-entry = "bin/fuck-u-code-plugin"
-commands = ["fuc", "fucku"]
-timeout_ms = 20000
+```
+<plugin_binary> --manifest
 ```
 
-插件通过 **stdin/stdout JSON** 通信：
+并输出 JSON 清单：
 
-**输入（stdin）**
 ```json
-{
-  "command": "fuc",
-  "args": "https://github.com/xxx/yyy",
-  "raw_text": "/fuc https://github.com/xxx/yyy",
-  "message_type": "group",
-  "user_id": 123,
-  "group_id": 456,
-  "self_id": 789,
-  "config_dir": "Plugins/fuck-u-code/config"
-}
+{ "name": "my-plugin", "commands": ["hello"], "timeout_ms": 20000 }
 ```
 
-**输出（stdout）**（两种任选）
-```json
-{ "reply": "分析结果...", "mention_sender": true }
-```
+通信方式：stdin/stdout 按行 JSON（必须回传 `request_id`）。
 
-或直接输出纯文本（默认当作回复内容）。
-
-> 插件代码建议独立仓库开发，编译后仅把可执行文件放进 `Plugins/<name>/bin/`，避免污染 XzBot 主仓库。
+详细规范见 `docs/PLUGINS.md`。
 
 ## 项目结构
 
@@ -164,6 +143,6 @@ src/
 ├── llm/ocr.rs        # OCR 兜底（Tesseract / Paddle）
 ├── onebot/          # OneBot v11 事件与动作
 ├── store/           # 会话内存存储
-├── plugins/         # 插件系统（外部进程）
+├── plugins/         # 插件系统（托管进程）
 └── tools/           # Function Call 工具实现
 ```
