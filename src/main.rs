@@ -476,8 +476,12 @@ async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
     let new_runtime = build_runtime(new_config.clone(), state.store.clone(), plugins)?;
 
     let mut runtime = state.runtime.write().await;
+    let old_router = runtime.router.clone();
     let old_config = runtime.config.clone();
     *runtime = new_runtime;
+
+    drop(runtime);
+    old_router.shutdown_plugins().await;
 
     let server_rebind_required = old_config.server.host != new_config.server.host
         || old_config.server.port != new_config.server.port

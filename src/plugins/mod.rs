@@ -85,6 +85,12 @@ impl PluginManager {
         self.plugins.len()
     }
 
+    pub async fn shutdown(&self) {
+        for plugin in &self.plugins {
+            plugin.shutdown(self.config.debug).await;
+        }
+    }
+
     pub async fn try_handle(&self, event: &MessageEvent) -> Result<Option<ActionRequest>> {
         let raw_text = event.text();
         let at_me = format!("[CQ:at,qq={}]", event.self_id);
@@ -261,6 +267,21 @@ impl ManagedPlugin {
 
         *guard = Some(process);
         response
+    }
+
+    async fn shutdown(&self, debug: bool) {
+        let mut guard = self.process.lock().await;
+        let Some(mut proc) = guard.take() else {
+            return;
+        };
+        if debug {
+            log_debug(debug, format!("stopping plugin {}", self.name));
+        }
+        if let Err(err) = proc.child.kill().await {
+            log_warn(format!("failed to kill plugin {}: {}", self.name, err));
+            return;
+        }
+        let _ = proc.child.wait().await;
     }
 }
 

@@ -92,6 +92,10 @@ impl BotRouter {
         self.ai_chat.handle_message(event).await
     }
 
+    pub async fn shutdown_plugins(&self) {
+        self.plugins.shutdown().await;
+    }
+
     fn allowed_by_permission(&self, event: &MessageEvent) -> bool {
         if event.message_type == "group" {
             let Some(group_id) = event.group_id else {
