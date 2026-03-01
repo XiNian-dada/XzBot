@@ -106,7 +106,8 @@ XzBot 启动时扫描 `Plugins/` 下所有**可执行文件**。
 - `file_name`：发送时展示的文件名（可选，默认取文件名）
 
 > 仅当插件严格输出 JSON 行，XzBot 才能正确匹配请求。  
-> 请勿在 stdout 输出日志，日志请写入 stderr 或文件。
+> 请勿在 stdout 输出日志，日志请写入 stderr 或文件。  
+> XzBot 会把插件 **stderr** 输出转发到控制台（带前缀）。
 
 ---
 

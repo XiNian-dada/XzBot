@@ -13,13 +13,13 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::{
     config::Config,
-    logger::{debug as log_debug, warn as log_warn},
+    logger::{debug as log_debug, info as log_info, warn as log_warn},
     onebot::{action::ActionRequest, event::MessageEvent},
 };
 
@@ -326,12 +326,45 @@ async fn ensure_process(
         .stdout
         .take()
         .ok_or_else(|| anyhow!("failed to capture plugin stdout"))?;
+    if let Some(stderr) = child.stderr.take() {
+        spawn_plugin_log_task(
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("plugin")
+                .to_string(),
+            stderr,
+        );
+    }
 
     Ok(PluginProcess {
         child,
         stdin,
         stdout: BufReader::new(stdout),
     })
+}
+
+fn spawn_plugin_log_task(name: String, stderr: ChildStderr) {
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let msg = line.trim_end();
+                    if msg.is_empty() {
+                        continue;
+                    }
+                    log_info(format!("[PLUGIN:{name}] {msg}"));
+                }
+                Err(err) => {
+                    log_warn(format!("[PLUGIN:{name}] stderr read error: {err}"));
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn read_response(
