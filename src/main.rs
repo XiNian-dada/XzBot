@@ -36,6 +36,7 @@ use crate::{
     logger::{debug as log_debug, error as log_error, info as log_info, warn as log_warn},
     onebot::action::ActionRequest,
     onebot::event::{extract_cq_image_refs, MessageEvent, MessagePayload},
+    plugins::PluginManager,
     store::memory::MemoryStore,
     tools::http::build_client,
 };
@@ -45,6 +46,7 @@ mod config;
 mod llm;
 mod logger;
 mod onebot;
+mod plugins;
 mod store;
 mod token_stats;
 mod tools;
@@ -137,7 +139,16 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::load(&config_path)?);
     check_proxy_availability(&config.network).await?;
     let store = Arc::new(MemoryStore::new());
-    let runtime = Arc::new(RwLock::new(build_runtime(config.clone(), store.clone())?));
+    let plugin_root = std::env::current_dir()?.join("Plugins");
+    let plugins = PluginManager::load_from_dir(&plugin_root, config.clone())?;
+    log_info(format!("Plugins dir: {}", plugin_root.display()));
+    log_info(format!("Loaded plugins: {}", plugins.plugin_count()));
+
+    let runtime = Arc::new(RwLock::new(build_runtime(
+        config.clone(),
+        store.clone(),
+        plugins,
+    )?));
 
     let ws_path = config.server.ws_path.clone();
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
@@ -160,7 +171,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_runtime(config: Arc<Config>, store: Arc<MemoryStore>) -> anyhow::Result<RuntimeState> {
+fn build_runtime(
+    config: Arc<Config>,
+    store: Arc<MemoryStore>,
+    plugins: PluginManager,
+) -> anyhow::Result<RuntimeState> {
     let llm: Arc<dyn Llm> = match config.ai.provider {
         AiProvider::Mock => Arc::new(MockLlm::new(
             config.debug,
@@ -182,7 +197,7 @@ fn build_runtime(config: Arc<Config>, store: Arc<MemoryStore>) -> anyhow::Result
         )?),
     };
     let ai_chat = AiChatPlugin::new(store, llm, config.clone());
-    let router = Arc::new(BotRouter::new(ai_chat, config.clone()));
+    let router = Arc::new(BotRouter::new(ai_chat, plugins, config.clone()));
 
     Ok(RuntimeState { router, config })
 }
@@ -456,7 +471,9 @@ fn reload_reply_action(event: &MessageEvent, message: String) -> ActionRequest {
 async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
     let config_path = state.config_path.as_ref();
     let new_config = Arc::new(Config::load(config_path)?);
-    let new_runtime = build_runtime(new_config.clone(), state.store.clone())?;
+    let plugin_root = std::env::current_dir()?.join("Plugins");
+    let plugins = PluginManager::load_from_dir(&plugin_root, new_config.clone())?;
+    let new_runtime = build_runtime(new_config.clone(), state.store.clone(), plugins)?;
 
     let mut runtime = state.runtime.write().await;
     let old_config = runtime.config.clone();

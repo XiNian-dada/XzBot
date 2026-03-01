@@ -8,17 +8,19 @@ use crate::{
     config::{Config, PermissionMode, TriggerMode},
     logger::debug as log_debug,
     onebot::{action::ActionRequest, event::MessageEvent},
+    plugins::PluginManager,
 };
 
 pub struct BotRouter {
     ai_chat: AiChatPlugin,
+    plugins: PluginManager,
     config: Arc<Config>,
     runtime_group_blacklist: DashSet<i64>,
     group_repeat_state: DashMap<i64, GroupRepeatState>,
 }
 
 impl BotRouter {
-    pub fn new(ai_chat: AiChatPlugin, config: Arc<Config>) -> Self {
+    pub fn new(ai_chat: AiChatPlugin, plugins: PluginManager, config: Arc<Config>) -> Self {
         let runtime_group_blacklist = DashSet::new();
         for &group_id in &config.group.blacklist {
             runtime_group_blacklist.insert(group_id);
@@ -26,6 +28,7 @@ impl BotRouter {
 
         Self {
             ai_chat,
+            plugins,
             config,
             runtime_group_blacklist,
             group_repeat_state: DashMap::new(),
@@ -54,6 +57,17 @@ impl BotRouter {
                 ),
             );
             return Ok(None);
+        }
+
+        if let Some(action) = self.plugins.try_handle(&event).await? {
+            log_debug(
+                self.config.debug,
+                format!(
+                    "route to plugin message_type={} user_id={} group_id={:?}",
+                    event.message_type, event.user_id, event.group_id
+                ),
+            );
+            return Ok(Some(action));
         }
 
         if let Some(action) = self.try_group_repeat(&event) {
