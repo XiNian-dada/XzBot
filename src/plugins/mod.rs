@@ -19,7 +19,7 @@ use tokio::time::timeout;
 
 use crate::{
     config::Config,
-    logger::debug as log_debug,
+    logger::{debug as log_debug, warn as log_warn},
     onebot::{action::ActionRequest, event::MessageEvent},
 };
 
@@ -119,8 +119,39 @@ impl PluginManager {
             self_id: event.self_id,
             config_dir: plugin.config_dir.to_string_lossy().to_string(),
         };
-
         let reply = plugin.call(req, self.config.debug).await?;
+        if let Some(file_path) = reply.file_path.as_ref() {
+            let resolved = resolve_plugin_path(file_path, &plugin.config_dir);
+            if !resolved.exists() {
+                log_warn(format!(
+                    "plugin {} file not found: {}",
+                    plugin.name,
+                    resolved.display()
+                ));
+            } else {
+                let file_name = reply
+                    .file_name
+                    .clone()
+                    .or_else(|| resolved.file_name().map(|s| s.to_string_lossy().to_string()));
+                let action = match event.message_type.as_str() {
+                    "group" => {
+                        let group_id = event.group_id.unwrap_or_default();
+                        ActionRequest::upload_group_file(
+                            group_id,
+                            resolved.to_string_lossy().to_string(),
+                            file_name,
+                        )
+                    }
+                    _ => ActionRequest::upload_private_file(
+                        event.user_id,
+                        resolved.to_string_lossy().to_string(),
+                        file_name,
+                    ),
+                };
+                return Ok(Some(action));
+            }
+        }
+
         if reply.reply.trim().is_empty() {
             return Ok(None);
         }
@@ -314,6 +345,8 @@ async fn read_response(
                 request_id: None,
                 reply: trimmed.to_string(),
                 mention_sender: None,
+                file_path: None,
+                file_name: None,
             });
         }
     };
@@ -343,6 +376,10 @@ struct PluginResponse {
     reply: String,
     #[serde(default)]
     mention_sender: Option<bool>,
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
 }
 
 fn read_plugin_manifest(path: &Path) -> Option<PluginManifestInfo> {
@@ -369,4 +406,13 @@ fn parse_command(text: &str) -> Option<(String, String)> {
     }
     let args = parts.next().unwrap_or("").trim().to_string();
     Some((head.to_lowercase(), args))
+}
+
+fn resolve_plugin_path(path: &str, config_dir: &Path) -> PathBuf {
+    let p = Path::new(path.trim());
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        config_dir.join(p)
+    }
 }

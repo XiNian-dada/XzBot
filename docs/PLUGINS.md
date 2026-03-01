@@ -93,6 +93,18 @@ XzBot 启动时扫描 `Plugins/` 下所有**可执行文件**。
 - `reply`：回复文本
 - `mention_sender`：是否 @ 发送者（可选）
 
+**发送文件（可选）**
+```json
+{
+  "request_id": "my-plugin-1",
+  "file_path": "report.md",
+  "file_name": "report.md"
+}
+```
+
+- `file_path`：要发送的文件路径（相对路径会基于 `config_dir` 解析）
+- `file_name`：发送时展示的文件名（可选，默认取文件名）
+
 > 仅当插件严格输出 JSON 行，XzBot 才能正确匹配请求。  
 > 请勿在 stdout 输出日志，日志请写入 stderr 或文件。
 

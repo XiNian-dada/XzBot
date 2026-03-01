@@ -31,4 +31,34 @@ impl ActionRequest {
             echo: None,
         }
     }
+
+    pub fn upload_group_file(group_id: i64, file: String, name: Option<String>) -> Self {
+        let mut params = json!({
+            "group_id": group_id,
+            "file": file
+        });
+        if let Some(name) = name {
+            params["name"] = json!(name);
+        }
+        Self {
+            action: "upload_group_file".to_string(),
+            params,
+            echo: None,
+        }
+    }
+
+    pub fn upload_private_file(user_id: i64, file: String, name: Option<String>) -> Self {
+        let mut params = json!({
+            "user_id": user_id,
+            "file": file
+        });
+        if let Some(name) = name {
+            params["name"] = json!(name);
+        }
+        Self {
+            action: "upload_private_file".to_string(),
+            params,
+            echo: None,
+        }
+    }
 }
