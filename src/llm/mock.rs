@@ -1,31 +1,38 @@
 use async_trait::async_trait;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::{
-    config::SearchConfig,
+    config::{NetworkConfig, SearchConfig},
     llm::Llm,
     tools::system::get_system_info,
-    tools::web::{extract_urls, fetch_url, search_web},
+    tools::{
+        http::build_client,
+        web::{extract_urls, fetch_url, search_web},
+    },
 };
 
 pub struct MockLlm {
     client: reqwest::Client,
     debug: bool,
     search: SearchConfig,
+    network: NetworkConfig,
 }
 
 impl MockLlm {
-    pub fn new(debug: bool, timeout_ms: u64, search: SearchConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .build()
+    pub fn new(
+        debug: bool,
+        timeout_ms: u64,
+        search: SearchConfig,
+        network: NetworkConfig,
+    ) -> Result<Self> {
+        let client = build_client(timeout_ms, &network, false)
             .context("failed to build HTTP client for MockLlm")?;
         Ok(Self {
             client,
             debug,
             search,
+            network,
         })
     }
 }
@@ -58,7 +65,15 @@ impl Llm for MockLlm {
         }
 
         if should_search(&last_user_message) {
-            match search_web(&self.client, &last_user_message, self.debug, &self.search).await {
+            match search_web(
+                &self.client,
+                &last_user_message,
+                self.debug,
+                &self.search,
+                &self.network,
+            )
+            .await
+            {
                 Ok(v) => extras.push(format!("[search_web]\n{v}")),
                 Err(err) => extras.push(format!("[search_web error] {err}")),
             }

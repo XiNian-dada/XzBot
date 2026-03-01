@@ -14,7 +14,7 @@ const DEFAULT_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 const BROWSER_SEC_CH_UA: &str =
     "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"";
-use crate::config::{SearchConfig, SearchProvider};
+use crate::config::{NetworkConfig, SearchConfig, SearchProvider};
 
 const MAX_FETCH_CHARS: usize = 5000;
 const MAX_SEARCH_PREVIEW_CHARS: usize = 700;
@@ -41,6 +41,7 @@ pub async fn search_web(
     query: &str,
     debug: bool,
     search: &SearchConfig,
+    network: &NetworkConfig,
 ) -> Result<String> {
     let query = query.trim();
     if query.is_empty() {
@@ -69,7 +70,7 @@ pub async fn search_web(
         return search_web_searxng(client, query, debug, search, &cache_key).await;
     }
 
-    let search_client = match build_search_session_client() {
+    let search_client = match build_search_session_client(network) {
         Ok(c) => c,
         Err(err) => {
             if debug {
@@ -519,11 +520,8 @@ fn cache_search_result(cache_key: &str, body: &str) {
     );
 }
 
-fn build_search_session_client() -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(20))
-        .cookie_store(true)
-        .build()
+fn build_search_session_client(network: &NetworkConfig) -> Result<Client> {
+    crate::tools::http::build_client(20_000, network, true)
         .context("failed to build search session client")
 }
 
@@ -585,81 +583,14 @@ async fn search_web_searxng(
         debug_log_hits("search.searxng", q, &hits, 8);
     }
 
-    let variants = build_query_variants(q);
-    let strict_identifier =
-        extract_identifier_token(q).filter(|token| should_enable_identifier_filter(q, token));
-    let mut ranked = rank_search_hits(q, &variants, hits.clone(), strict_identifier.as_deref());
-    if ranked.is_empty() && strict_identifier.is_some() {
-        ranked = rank_search_hits(q, &variants, hits.clone(), None);
-    }
-
-    if ranked.is_empty() {
-        let intent_terms = extract_intent_terms(q);
-        let strict_token = strict_identifier.as_deref();
-        let constrained_hits = take_unique_hits_preserve_order(
-            hits.iter()
-                .filter(|hit| {
-                    if let Some(token) = strict_token {
-                        if !hit_matches_identifier(hit, token) {
-                            return false;
-                        }
-                    }
-                    if !intent_terms.is_empty() && !hit_matches_intent_terms(hit, &intent_terms) {
-                        return false;
-                    }
-                    true
-                })
-                .cloned()
-                .collect(),
-            5,
-        );
-
-        if strict_identifier.is_some() && constrained_hits.is_empty() {
-            if let Some(token) = strict_identifier {
-                let out = format!(
-                    "未在 SearXNG 检索到包含标识符 `{token}` 的有效结果。\n建议：\n1) 直接附上目标主页链接\n2) 用引号精确检索，例如 `\"{token}\"`\n3) 检查是否存在大小写/下划线/连字符差异"
-                );
-                cache_search_result(cache_key, &out);
-                return Ok(out);
-            }
-        }
-
-        if constrained_hits.is_empty() {
-            let out = format!(
-                "未在 SearXNG 检索到与 `{q}` 明确相关的结果（当前结果相关性过低，已丢弃）。\n建议：\n1) 给更具体关键词（如地名/平台/全名）\n2) 直接提供目标链接\n3) 用引号精确检索，例如 `\"{q}\"`"
-            );
-            cache_search_result(cache_key, &out);
-            return Ok(out);
-        }
-
-        let mut out =
-            format!("Web 搜索结果（provider: searxng, query: {q}，按关键词强匹配回退）:\n");
-        for (idx, hit) in constrained_hits.iter().enumerate() {
-            if hit.snippet.is_empty() {
-                out.push_str(&format!(
-                    "{}. [{}] {} - {}\n",
-                    idx + 1,
-                    hit.source,
-                    hit.title,
-                    hit.url
-                ));
-            } else {
-                out.push_str(&format!(
-                    "{}. [{}] {} - {} - {}\n",
-                    idx + 1,
-                    hit.source,
-                    hit.title,
-                    hit.url,
-                    hit.snippet
-                ));
-            }
-        }
-        let out = out.trim().to_string();
+    if hits.is_empty() {
+        let out = format!("未在 SearXNG 检索到结果。query={q}");
         cache_search_result(cache_key, &out);
         return Ok(out);
     }
 
-    let top_hits: Vec<SearchHit> = ranked.into_iter().take(5).collect();
+    // SearXNG：不做清洗，保持原始顺序，仅去重。
+    let top_hits = take_unique_hits_preserve_order(hits, 5);
     let mut out = format!("Web 搜索结果（provider: searxng, query: {q}）:\n");
     for (idx, hit) in top_hits.iter().enumerate() {
         if hit.snippet.is_empty() {
@@ -775,6 +706,31 @@ async fn search_searxng(
     query: &str,
     debug: bool,
 ) -> Result<Vec<SearchHit>> {
+    let json_attempt = search_searxng_json(client, base_url, query, debug).await;
+    match json_attempt {
+        Ok(hits) if !hits.is_empty() => return Ok(hits),
+        Ok(_) => {
+            if debug {
+                println!("[DEBUG] search.searxng json empty, fallback html");
+            }
+        }
+        Err(err) => {
+            if debug {
+                println!("[DEBUG] search.searxng json failed, fallback html: {err}");
+            }
+        }
+    }
+
+    let html_hits = search_searxng_html(client, base_url, query, debug).await?;
+    Ok(html_hits)
+}
+
+async fn search_searxng_json(
+    client: &Client,
+    base_url: &str,
+    query: &str,
+    debug: bool,
+) -> Result<Vec<SearchHit>> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         bail!("searxng_url is empty");
@@ -787,6 +743,7 @@ async fn search_searxng(
         .get(&search_url)
         .header("User-Agent", DEFAULT_UA)
         .header("Accept", "application/json")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
         .send()
         .await
         .with_context(|| format!("searxng request failed: {search_url}"))?;
@@ -842,7 +799,7 @@ async fn search_searxng(
 
     if debug {
         println!(
-            "[DEBUG] search.searxng query={} url={} hits={}",
+            "[DEBUG] search.searxng json query={} url={} hits={}",
             query,
             search_url,
             out.len()
@@ -850,6 +807,52 @@ async fn search_searxng(
     }
 
     Ok(out)
+}
+
+async fn search_searxng_html(
+    client: &Client,
+    base_url: &str,
+    query: &str,
+    debug: bool,
+) -> Result<Vec<SearchHit>> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        bail!("searxng_url is empty");
+    }
+    let encoded = urlencoding::encode(query);
+    let search_url = format!("{base}/search?q={encoded}");
+
+    let response = client
+        .get(&search_url)
+        .header("User-Agent", DEFAULT_UA)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .send()
+        .await
+        .with_context(|| format!("searxng html request failed: {search_url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read searxng html response body")?;
+
+    if !status.is_success() {
+        bail!("searxng html endpoint returned {status}: {body}");
+    }
+
+    let hits = parse_searxng_results(&body)?;
+    if debug {
+        println!(
+            "[DEBUG] search.searxng html query={} url={} hits={}",
+            query,
+            search_url,
+            hits.len()
+        );
+    }
+    Ok(hits)
 }
 
 #[allow(dead_code)]
@@ -1200,6 +1203,48 @@ fn parse_bing_results(html: &str) -> Result<Vec<SearchHit>> {
     Ok(out)
 }
 
+fn parse_searxng_results(html: &str) -> Result<Vec<SearchHit>> {
+    let doc = Html::parse_document(html);
+    let item_sel = Selector::parse("article.result, div.result, li.result")
+        .map_err(|err| anyhow!("failed to parse selector searxng item: {err}"))?;
+    let title_sel = Selector::parse("h3 a, h4 a, a")
+        .map_err(|err| anyhow!("failed to parse selector searxng title: {err}"))?;
+    let snippet_sel = Selector::parse(".result__snippet, .result-content, p")
+        .map_err(|err| anyhow!("failed to parse selector searxng snippet: {err}"))?;
+
+    let mut out = Vec::new();
+    for item in doc.select(&item_sel).take(12) {
+        let Some(title_node) = item.select(&title_sel).next() else {
+            continue;
+        };
+        let title = normalize_whitespace(&title_node.text().collect::<Vec<_>>().join(" "));
+        let raw_href = title_node
+            .value()
+            .attr("href")
+            .map(decode_html_entities_basic)
+            .unwrap_or_default();
+        let href = normalize_generic_href(&raw_href);
+        if href.is_empty() || !is_valid_result_url(&href) {
+            continue;
+        }
+
+        let snippet = item
+            .select(&snippet_sel)
+            .next()
+            .map(|n| normalize_whitespace(&n.text().collect::<Vec<_>>().join(" ")))
+            .unwrap_or_default();
+
+        out.push(SearchHit {
+            title,
+            url: href,
+            snippet,
+            source: "searxng",
+        });
+    }
+
+    Ok(out)
+}
+
 #[allow(dead_code)]
 fn parse_baidu_results(html: &str) -> Result<Vec<SearchHit>> {
     let doc = Html::parse_document(html);
@@ -1444,6 +1489,10 @@ fn rank_search_hits(
     let terms = build_query_terms(query_variants);
     let intent_terms = extract_intent_terms(original_query);
     let core_terms = extract_core_terms(original_query);
+    let core_terms_active = !core_terms.is_empty()
+        && hits
+            .iter()
+            .any(|hit| hit_matches_core_terms(hit, &core_terms));
     if hits.is_empty() {
         return Vec::new();
     }
@@ -1457,7 +1506,7 @@ fn rank_search_hits(
                 continue;
             }
         }
-        if !core_terms.is_empty() && !hit_matches_core_terms(&hit, &core_terms) {
+        if core_terms_active && !hit_matches_core_terms(&hit, &core_terms) {
             continue;
         }
         if !intent_terms.is_empty() && !hit_matches_intent_terms(&hit, &intent_terms) {

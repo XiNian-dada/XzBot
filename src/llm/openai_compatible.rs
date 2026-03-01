@@ -5,13 +5,20 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::{
-    config::{AiConfig, SearchConfig},
+    config::{AiConfig, NetworkConfig, SearchConfig, VisionMode},
     llm::Llm,
-    llm::{image::load_image_for_llm, message_parts::parse_user_content},
+    llm::{
+        image::load_image_for_llm,
+        message_parts::{parse_user_content, ParsedUserContent},
+        ocr::{ocr_images_to_text, OcrSettings},
+    },
     token_stats,
     tools::system::get_system_info,
     tools::weather::get_weather,
-    tools::web::{extract_urls, fetch_url, search_web},
+    tools::{
+        http::build_client,
+        web::{extract_urls, fetch_url, search_web},
+    },
 };
 
 pub struct OpenAiCompatibleLlm {
@@ -25,6 +32,9 @@ pub struct OpenAiCompatibleLlm {
     timeout_ms: u64,
     debug: bool,
     search: SearchConfig,
+    network: NetworkConfig,
+    vision_mode: VisionMode,
+    ocr_settings: OcrSettings,
 }
 
 impl OpenAiCompatibleLlm {
@@ -82,16 +92,19 @@ impl OpenAiCompatibleLlm {
 
         Ok((format!("{reply}\n{continued}"), true))
     }
-    pub fn from_config(config: &AiConfig, search: &SearchConfig, debug: bool) -> Result<Self> {
+    pub fn from_config(
+        config: &AiConfig,
+        search: &SearchConfig,
+        network: &NetworkConfig,
+        debug: bool,
+    ) -> Result<Self> {
         let base = config.base_url.trim_end_matches('/').to_string();
         let endpoint = if base.ends_with("/chat/completions") {
             base
         } else {
             format!("{base}/chat/completions")
         };
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .build()
+        let client = build_client(config.timeout_ms, network, false)
             .context("failed to build HTTP client for OpenAI-compatible provider")?;
 
         Ok(Self {
@@ -105,6 +118,21 @@ impl OpenAiCompatibleLlm {
             timeout_ms: config.timeout_ms,
             debug,
             search: search.clone(),
+            network: network.clone(),
+            vision_mode: config.vision_mode,
+            ocr_settings: OcrSettings {
+                provider: config.ocr_provider,
+                cmd: config.ocr_cmd.clone(),
+                lang: config.ocr_lang.clone(),
+                timeout_ms: config.ocr_timeout_ms,
+                paddle_endpoint: config.paddle_ocr_endpoint.clone(),
+                paddle_token: config.paddle_ocr_token.clone(),
+                paddle_file_type: config.paddle_file_type,
+                paddle_use_doc_orientation_classify: config.paddle_use_doc_orientation_classify,
+                paddle_use_doc_unwarping: config.paddle_use_doc_unwarping,
+                paddle_use_chart_recognition: config.paddle_use_chart_recognition,
+                paddle_use_proxy: config.paddle_use_proxy,
+            },
         })
     }
 }
@@ -617,8 +645,15 @@ impl OpenAiCompatibleLlm {
                 let with_images = Some(idx) == last_user_idx
                     && (!parsed.image_urls.is_empty() || !parsed.image_files.is_empty());
                 if with_images {
-                    let payload = self.build_openai_user_content_with_images(parsed).await;
-                    out.push(json!({ "role": "user", "content": payload }));
+                    if self.should_send_images() {
+                        let payload = self.build_openai_user_content_with_images(parsed).await;
+                        out.push(json!({ "role": "user", "content": payload }));
+                    } else if self.should_use_ocr() {
+                        let text = self.build_user_text_with_ocr(parsed).await;
+                        out.push(json!({ "role": "user", "content": text }));
+                    } else {
+                        out.push(json!({ "role": "user", "content": parsed.text }));
+                    }
                 } else {
                     out.push(json!({ "role": "user", "content": parsed.text }));
                 }
@@ -729,6 +764,49 @@ impl OpenAiCompatibleLlm {
         Value::Array(blocks)
     }
 
+    async fn build_user_text_with_ocr(&self, parsed: ParsedUserContent) -> String {
+        let image_refs = collect_image_refs(&parsed);
+        let mut text = parsed.text;
+        if image_refs.is_empty() {
+            return text;
+        }
+
+        if self.debug {
+            println!(
+                "[DEBUG] using ocr fallback refs={} mode={:?}",
+                image_refs.len(),
+                self.vision_mode
+            );
+        }
+
+        let ocr_text =
+            ocr_images_to_text(&self.client, &image_refs, &self.ocr_settings, self.debug).await;
+        if !ocr_text.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&ocr_text);
+        }
+
+        text
+    }
+
+    fn should_send_images(&self) -> bool {
+        match self.vision_mode {
+            VisionMode::Multimodal => true,
+            VisionMode::Ocr | VisionMode::Off => false,
+            VisionMode::Auto => model_seems_multimodal(&self.model),
+        }
+    }
+
+    fn should_use_ocr(&self) -> bool {
+        match self.vision_mode {
+            VisionMode::Ocr => true,
+            VisionMode::Auto => !model_seems_multimodal(&self.model),
+            VisionMode::Multimodal | VisionMode::Off => false,
+        }
+    }
+
     async fn execute_tool_call(&self, call: &OpenAiToolCall) -> String {
         match call.name.as_str() {
             "search_web" => {
@@ -744,7 +822,15 @@ impl OpenAiCompatibleLlm {
                 if query.is_empty() {
                     return "search_web error: query is empty".to_string();
                 }
-                match search_web(&self.client, &query, self.debug, &self.search).await {
+                match search_web(
+                    &self.client,
+                    &query,
+                    self.debug,
+                    &self.search,
+                    &self.network,
+                )
+                .await
+                {
                     Ok(v) => wrap_untrusted_tool_output("search_web", v),
                     Err(err) => format!("search_web error: {err}"),
                 }
@@ -1298,6 +1384,47 @@ fn is_loadable_image_ref(value: &str) -> bool {
         || v.starts_with("base64://")
         || v.starts_with("data:image/")
         || v.starts_with("file://")
+}
+
+fn collect_image_refs(parsed: &ParsedUserContent) -> Vec<String> {
+    let mut refs = Vec::new();
+    for url in &parsed.image_urls {
+        if is_loadable_image_ref(url) {
+            refs.push(url.clone());
+        }
+    }
+    for file in &parsed.image_files {
+        if !is_loadable_image_ref(file) {
+            continue;
+        }
+        if !refs.iter().any(|v| v == file) {
+            refs.push(file.clone());
+        }
+    }
+    refs
+}
+
+fn model_seems_multimodal(model: &str) -> bool {
+    let m = model.to_lowercase();
+    let keywords = [
+        "vision",
+        "multimodal",
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-4v",
+        "gpt-4-vision",
+        "claude-3",
+        "claude-3.5",
+        "claude-3.7",
+        "gemini",
+        "qwen-vl",
+        "llava",
+        "internvl",
+        "yi-vision",
+        "pixtral",
+        "cogvlm",
+    ];
+    keywords.iter().any(|k| m.contains(k))
 }
 
 fn temporary_network_reply() -> String {

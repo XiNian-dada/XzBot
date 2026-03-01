@@ -5,6 +5,7 @@ pub mod image;
 pub mod message_parts;
 pub mod mock;
 pub mod openai_compatible;
+pub mod ocr;
 
 #[async_trait]
 pub trait Llm: Send + Sync {

@@ -28,7 +28,7 @@ use tokio::time::timeout;
 
 use crate::{
     bot::{ai_chat::AiChatPlugin, router::BotRouter},
-    config::{AiProvider, Config},
+    config::{AiProvider, Config, NetworkConfig},
     llm::{
         anthropic_compatible::AnthropicCompatibleLlm, mock::MockLlm,
         openai_compatible::OpenAiCompatibleLlm, Llm,
@@ -37,6 +37,7 @@ use crate::{
     onebot::action::ActionRequest,
     onebot::event::{extract_cq_image_refs, MessageEvent, MessagePayload},
     store::memory::MemoryStore,
+    tools::http::build_client,
 };
 
 mod bot;
@@ -134,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
     let config_path = exe_dir.join("config").join("config.toml");
 
     let config = Arc::new(Config::load(&config_path)?);
+    check_proxy_availability(&config.network).await?;
     let store = Arc::new(MemoryStore::new());
     let runtime = Arc::new(RwLock::new(build_runtime(config.clone(), store.clone())?));
 
@@ -164,15 +166,18 @@ fn build_runtime(config: Arc<Config>, store: Arc<MemoryStore>) -> anyhow::Result
             config.debug,
             config.ai.timeout_ms,
             config.search.clone(),
+            config.network.clone(),
         )?),
         AiProvider::OpenaiCompatible => Arc::new(OpenAiCompatibleLlm::from_config(
             &config.ai,
             &config.search,
+            &config.network,
             config.debug,
         )?),
         AiProvider::AnthropicCompatible => Arc::new(AnthropicCompatibleLlm::from_config(
             &config.ai,
             &config.search,
+            &config.network,
             config.debug,
         )?),
     };
@@ -180,6 +185,30 @@ fn build_runtime(config: Arc<Config>, store: Arc<MemoryStore>) -> anyhow::Result
     let router = Arc::new(BotRouter::new(ai_chat, config.clone()));
 
     Ok(RuntimeState { router, config })
+}
+
+async fn check_proxy_availability(config: &NetworkConfig) -> anyhow::Result<()> {
+    if !config.proxy_enabled {
+        return Ok(());
+    }
+    let client = build_client(config.proxy_timeout_ms, config, false)
+        .context("failed to build proxy check client")?;
+    let url = config.proxy_test_url.trim();
+    if url.is_empty() {
+        return Err(anyhow!("proxy_test_url is empty"));
+    }
+    let response = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .with_context(|| format!("proxy check request failed: {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("proxy check failed: status {} for {}", status, url));
+    }
+    log_info(format!("proxy check ok via {}", url));
+    Ok(())
 }
 
 async fn onebot_ws_handler(

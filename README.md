@@ -1,6 +1,6 @@
 # XzBot
 
-基于 **Rust + Tokio + Axum** 的 QQ 聊天机器人，通过 NapCat OneBot v11 反向 WebSocket 接入，支持多 LLM 后端与 Function Call 工具调用。
+基于 **Rust + Tokio + Axum** 的 QQ 聊天机器人，通过 NapCat OneBot v11 反向 WebSocket 接入，支持多 LLM 后端、Function Call 工具调用与 OCR 图片识别。
 
 ## 特性
 
@@ -8,11 +8,13 @@
 - **灵活触发规则** — 支持 @、前缀、关键词、混合模式
 - **多 LLM 后端** — OpenAI 兼容 / Anthropic 兼容 / Mock（测试用）
 - **上下文会话** — 内存存储，每用户/群保留最近 10 轮
-- **图片理解** — 自动提取消息及引用回复中的图片，传递给模型
+- **图片理解** — 自动提取消息及引用回复中的图片
+- **OCR 兜底** — 非多模态模型自动 OCR（Tesseract / PaddleOCR）
 - **Function Call 工具**
   - `search_web` — 网页搜索
   - `fetch_url` — 抓取 URL 内容
   - `get_system_info` — 只读系统信息
+  - `get_weather` — 天气查询
 - **权限控制** — 支持 None / OwnerOnly / Whitelist 三种模式
 - **运行时指令** — `/reset`、`/blacklist`（仅 owner）
 
@@ -42,7 +44,57 @@ cargo build --release
 ws://<主机IP>:3000/onebot/v11/ws
 ```
 
-> **安全提示：** 真实 `api_key` 只写入运行时配置（已被 `.gitignore` 忽略），切勿提交到 Git。
+> **安全提示：** 真实 `api_key` / OCR token 只写入运行时配置（已被 `.gitignore` 忽略），切勿提交到 Git。
+
+### 搜索配置
+
+- 内置 Bing（中国版）
+- 自建 SearXNG（启用后不再使用内置搜索）
+
+对应配置项：
+
+```toml
+[search]
+provider = "builtin"   # 或 "searxng"
+searxng_url = ""
+```
+
+### OCR 配置
+
+支持两类 OCR：
+
+1. **Tesseract（本地）**
+2. **Paddle OCR（HTTP API）**
+
+常用配置示例：
+
+```toml
+[ai]
+vision_mode = "auto"      # auto / multimodal / ocr / off
+ocr_provider = "tesseract" # 或 "paddle"
+ocr_cmd = "tesseract"
+ocr_lang = "chi_sim+eng"
+ocr_timeout_ms = 8000
+
+# Paddle OCR（layout-parsing）
+paddle_ocr_endpoint = ""
+paddle_ocr_token = ""
+paddle_file_type = 1
+paddle_use_proxy = true
+```
+
+### 代理配置
+
+所有 HTTP 请求默认走同一代理（LLM / 搜索 / OCR / fetch_url 等）。
+如需 **仅让 Paddle OCR 直连**，可设置 `paddle_use_proxy=false`。
+
+```toml
+[network]
+proxy_enabled = false
+proxy_url = ""
+proxy_test_url = "https://www.baidu.com"
+proxy_timeout_ms = 5000
+```
 
 ## 运行时指令
 
@@ -61,6 +113,7 @@ src/
 ├── config.rs        # 配置加载与校验
 ├── bot/             # 消息路由、AI 对话插件
 ├── llm/             # LLM 后端适配（OpenAI / Anthropic / Mock）
+├── llm/ocr.rs        # OCR 兜底（Tesseract / Paddle）
 ├── onebot/          # OneBot v11 事件与动作
 ├── store/           # 会话内存存储
 └── tools/           # Function Call 工具实现

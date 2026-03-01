@@ -121,6 +121,23 @@ provider = "builtin"
 # 例如 "https://searxng.example.com"
 searxng_url = ""
 
+[network]
+# 代理开关
+# - true  : 启用代理（支持 http/https/socks5/socks5h）
+# - false : 禁用代理
+proxy_enabled = false
+
+# 代理地址示例：
+# - http://127.0.0.1:7890
+# - socks5://127.0.0.1:7890
+proxy_url = ""
+
+# 启动时检测代理可用性（访问该 URL）
+proxy_test_url = "https://www.baidu.com"
+
+# 代理检测超时（毫秒）
+proxy_timeout_ms = 5000
+
 [ai]
 # LLM 提供方：
 # - "mock"               : 本地 mock，返回 AI Reply: xxx（不调用外网）
@@ -141,6 +158,44 @@ api_key = "REPLACE_WITH_YOUR_API_KEY"
 
 # 模型名
 model = "gpt-4.1-mini"
+
+# 视觉输入模式：
+# - "auto"        : 自动判断模型是否支持图片（默认）
+# - "multimodal"  : 强制按多模态发送图片（模型不支持会报错）
+# - "ocr"         : 强制 OCR（不向模型发送图片）
+# - "off"         : 忽略图片
+vision_mode = "auto"
+
+# OCR 命令（需要系统已安装 tesseract）
+ocr_cmd = "tesseract"
+
+# OCR 语言（tesseract -l 参数）
+ocr_lang = "chi_sim+eng"
+
+# OCR 超时（毫秒）
+ocr_timeout_ms = 8000
+
+# OCR 提供方：
+# - "tesseract" : 本地 tesseract
+# - "paddle"    : PaddleOCR API（layout-parsing）
+ocr_provider = "tesseract"
+
+# Paddle OCR API 地址（ocr_provider = "paddle" 时填写）
+paddle_ocr_endpoint = ""
+
+# Paddle OCR Token（ocr_provider = "paddle" 时填写）
+paddle_ocr_token = ""
+
+# Paddle OCR fileType：0=PDF，1=图片（本项目传图片时推荐 1）
+paddle_file_type = 1
+
+# Paddle OCR 可选参数
+paddle_use_doc_orientation_classify = false
+paddle_use_doc_unwarping = false
+paddle_use_chart_recognition = false
+
+# Paddle OCR 是否走代理（network.proxy_enabled=true 时生效）
+paddle_use_proxy = true
 
 # 采样温度
 temperature = 0.7
