@@ -105,6 +105,32 @@ XzBot 启动时扫描 `Plugins/` 下所有**可执行文件**。
 - `file_path`：要发送的文件路径（相对路径会基于 `config_dir` 解析）
 - `file_name`：发送时展示的文件名（可选，默认取文件名）
 
+**同时发送文件 + 回复文本（推荐）**
+```json
+{
+  "request_id": "my-plugin-1",
+  "file_path": "report.md",
+  "file_name": "report.md",
+  "reply": "已生成报告，已上传。",
+  "mention_sender": true
+}
+```
+
+> 处理顺序：先上传文件，再发送回复消息。
+
+**发送图片（可选）**
+```json
+{
+  "request_id": "my-plugin-1",
+  "image_path": "image.png"
+}
+```
+
+- `image_path`：图片文件路径（相对路径会基于 `config_dir` 解析）
+- `image_url`：图片 URL（直接发送，不走本地文件）
+
+> 图片会通过 CQ 码发送：`[CQ:image,file=...]`。
+
 > 仅当插件严格输出 JSON 行，XzBot 才能正确匹配请求。  
 > 请勿在 stdout 输出日志，日志请写入 stderr 或文件。  
 > XzBot 会把插件 **stderr** 输出转发到控制台（带前缀）。

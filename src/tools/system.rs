@@ -1,5 +1,122 @@
 use anyhow::Result;
-use sysinfo::{Disks, Networks, System};
+use std::fs;
+
+use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
+
+pub fn get_process_info() -> Result<String> {
+    let pid = sysinfo::get_current_pid().map_err(|err| anyhow::anyhow!(err))?;
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+
+    let Some(process) = system.process(pid) else {
+        return Ok("Process Info\nprocess not found".to_string());
+    };
+
+    let mut mem_rss_bytes = None;
+    let mut mem_vms_bytes = None;
+    if let Some(proc_mem) = read_proc_self_mem_bytes() {
+        mem_rss_bytes = proc_mem.rss;
+        mem_vms_bytes = proc_mem.vms;
+    }
+
+    let mem_rss_bytes = mem_rss_bytes.unwrap_or_else(|| process.memory().saturating_mul(1024));
+    let mem_vms_bytes =
+        mem_vms_bytes.unwrap_or_else(|| process.virtual_memory().saturating_mul(1024));
+
+    let disk = process.disk_usage();
+    let run_time = process.run_time();
+    let status = format!("{:?}", process.status());
+    let cpu = process.cpu_usage();
+
+    let mut out = format!(
+        "Process Info\npid: {}\nname: {}\nstatus: {}\nrun_time: {}\ncpu_usage: {:.1}%\nmem_rss: {}\nmem_vms: {}\ndisk_read: {}\ndisk_write: {}",
+        pid.as_u32(),
+        process.name().to_string_lossy(),
+        status,
+        format_uptime(run_time),
+        cpu,
+        format_bytes(mem_rss_bytes),
+        format_bytes(mem_vms_bytes),
+        format_bytes(disk.total_read_bytes),
+        format_bytes(disk.total_written_bytes),
+    );
+
+    if let Some(cgroup) = read_cgroup_memory() {
+        out.push_str(&format!(
+            "\nmem_cgroup_current: {}",
+            format_bytes(cgroup.current)
+        ));
+        if let Some(max) = cgroup.max {
+            out.push_str(&format!("\nmem_cgroup_max: {}", format_bytes(max)));
+        } else {
+            out.push_str("\nmem_cgroup_max: unlimited");
+        }
+    }
+
+    Ok(out)
+}
+
+#[derive(Debug)]
+struct ProcMemBytes {
+    rss: Option<u64>,
+    vms: Option<u64>,
+}
+
+fn read_proc_self_mem_bytes() -> Option<ProcMemBytes> {
+    let content = fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss_kb = None;
+    let mut vms_kb = None;
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            rss_kb = parse_kb_value(value);
+        } else if let Some(value) = line.strip_prefix("VmSize:") {
+            vms_kb = parse_kb_value(value);
+        }
+    }
+    if rss_kb.is_none() && vms_kb.is_none() {
+        return None;
+    }
+    Some(ProcMemBytes {
+        rss: rss_kb.map(|v| v.saturating_mul(1024)),
+        vms: vms_kb.map(|v| v.saturating_mul(1024)),
+    })
+}
+
+fn parse_kb_value(input: &str) -> Option<u64> {
+    let parts = input.split_whitespace().collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    parts[0].parse::<u64>().ok()
+}
+
+#[derive(Debug)]
+struct CgroupMemory {
+    current: u64,
+    max: Option<u64>,
+}
+
+fn read_cgroup_memory() -> Option<CgroupMemory> {
+    if let (Ok(current), Ok(max)) = (
+        fs::read_to_string("/sys/fs/cgroup/memory.current"),
+        fs::read_to_string("/sys/fs/cgroup/memory.max"),
+    ) {
+        let current = current.trim().parse::<u64>().ok()?;
+        let max = match max.trim() {
+            "max" => None,
+            v => v.parse::<u64>().ok(),
+        };
+        return Some(CgroupMemory { current, max });
+    }
+
+    let current = fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())?;
+    let max = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    Some(CgroupMemory { current, max })
+}
 
 pub fn get_system_info(scope: &str) -> Result<String> {
     let mut system = System::new_all();

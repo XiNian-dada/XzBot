@@ -95,26 +95,26 @@ impl PluginManager {
         }
     }
 
-    pub async fn try_handle(&self, event: &MessageEvent) -> Result<Option<ActionRequest>> {
+    pub async fn try_handle(&self, event: &MessageEvent) -> Result<Vec<ActionRequest>> {
         let raw_text = event.text();
         let at_me = format!("[CQ:at,qq={}]", event.self_id);
         let mentioned = raw_text.contains(&at_me);
         let normalized = raw_text.replace(&at_me, "").trim().to_string();
         if normalized.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let (cmd, args) = match parse_command(&normalized) {
             Some(v) => v,
-            None => return Ok(None),
+            None => return Ok(Vec::new()),
         };
 
         if event.message_type == "group" && self.config.group.require_at && !mentioned {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let Some(&idx) = self.command_map.get(&cmd) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let plugin = &self.plugins[idx];
 
@@ -130,6 +130,10 @@ impl PluginManager {
             config_dir: plugin.config_dir.to_string_lossy().to_string(),
         };
         let reply = plugin.call(req, self.config.debug).await?;
+        let mut actions = Vec::new();
+        let mention_sender = reply
+            .mention_sender
+            .unwrap_or(self.config.group.mention_sender);
         if let Some(file_path) = reply.file_path.as_ref() {
             let resolved = resolve_plugin_path(file_path, &plugin.config_dir);
             if !resolved.exists() {
@@ -158,17 +162,46 @@ impl PluginManager {
                         file_name,
                     ),
                 };
-                return Ok(Some(action));
+                actions.push(action);
+            }
+        }
+
+        if let Some(image_ref) = reply
+            .image_url
+            .clone()
+            .or_else(|| reply.image_path.clone())
+        {
+            let resolved = if reply.image_url.is_some() {
+                image_ref
+            } else {
+                resolve_plugin_path(&image_ref, &plugin.config_dir).to_string_lossy().to_string()
+            };
+            if reply.image_url.is_none() && !Path::new(&resolved).exists() {
+                log_warn(format!(
+                    "plugin {} image not found: {}",
+                    plugin.name, resolved
+                ));
+            } else {
+                let image_cq = format!("[CQ:image,file={}]", resolved);
+                let action = match event.message_type.as_str() {
+                    "group" => {
+                        let group_id = event.group_id.unwrap_or_default();
+                        let message = if mention_sender {
+                            format!("[CQ:at,qq={}] {}", event.user_id, image_cq)
+                        } else {
+                            image_cq
+                        };
+                        ActionRequest::send_group_msg(group_id, message)
+                    }
+                    _ => ActionRequest::send_private_msg(event.user_id, image_cq),
+                };
+                actions.push(action);
             }
         }
 
         if reply.reply.trim().is_empty() {
-            return Ok(None);
+            return Ok(actions);
         }
-
-        let mention_sender = reply
-            .mention_sender
-            .unwrap_or(self.config.group.mention_sender);
 
         let action = match event.message_type.as_str() {
             "group" => {
@@ -183,7 +216,8 @@ impl PluginManager {
             _ => ActionRequest::send_private_msg(event.user_id, reply.reply),
         };
 
-        Ok(Some(action))
+        actions.push(action);
+        Ok(actions)
     }
 }
 
@@ -405,6 +439,8 @@ async fn read_response(
                 mention_sender: None,
                 file_path: None,
                 file_name: None,
+                image_path: None,
+                image_url: None,
             });
         }
     };
@@ -438,6 +474,10 @@ struct PluginResponse {
     file_path: Option<String>,
     #[serde(default)]
     file_name: Option<String>,
+    #[serde(default)]
+    image_path: Option<String>,
+    #[serde(default)]
+    image_url: Option<String>,
 }
 
 fn read_plugin_manifest(path: &Path) -> Option<PluginManifestInfo> {

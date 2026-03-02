@@ -35,17 +35,17 @@ impl BotRouter {
         }
     }
 
-    pub async fn route_message(&self, event: MessageEvent) -> Result<Option<ActionRequest>> {
+    pub async fn route_message(&self, event: MessageEvent) -> Result<Vec<ActionRequest>> {
         if event.post_type != "message" {
             log_debug(
                 self.config.debug,
                 format!("skip post_type={} (not message)", event.post_type),
             );
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         if let Some(action) = self.handle_blacklist_command(&event) {
-            return Ok(Some(action));
+            return Ok(vec![action]);
         }
 
         if !self.allowed_by_permission(&event) {
@@ -56,10 +56,11 @@ impl BotRouter {
                     event.message_type, event.user_id, event.group_id
                 ),
             );
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
-        if let Some(action) = self.plugins.try_handle(&event).await? {
+        let plugin_actions = self.plugins.try_handle(&event).await?;
+        if !plugin_actions.is_empty() {
             log_debug(
                 self.config.debug,
                 format!(
@@ -67,11 +68,11 @@ impl BotRouter {
                     event.message_type, event.user_id, event.group_id
                 ),
             );
-            return Ok(Some(action));
+            return Ok(plugin_actions);
         }
 
         if let Some(action) = self.try_group_repeat(&event) {
-            return Ok(Some(action));
+            return Ok(vec![action]);
         }
 
         if event.message_type == "group" && !self.should_trigger_group(&event) {
@@ -79,7 +80,7 @@ impl BotRouter {
                 self.config.debug,
                 format!("group trigger miss group_id={:?}", event.group_id),
             );
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         log_debug(
@@ -89,7 +90,7 @@ impl BotRouter {
                 event.message_type, event.user_id, event.group_id
             ),
         );
-        self.ai_chat.handle_message(event).await
+        Ok(self.ai_chat.handle_message(event).await?.into_iter().collect())
     }
 
     pub async fn shutdown_plugins(&self) {

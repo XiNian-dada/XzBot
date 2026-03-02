@@ -391,12 +391,19 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
         println!("[DEBUG] tool.fetch_url url={url}");
     }
 
-    let response = client
-        .get(&url)
-        .header("User-Agent", DEFAULT_UA)
-        .send()
-        .await
-        .with_context(|| format!("fetch request failed: {url}"))?;
+    let response = match fetch_with_browser_profile(client, &url).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            if debug {
+                println!("[DEBUG] fetch primary failed url={} err={}", url, err);
+                println!("[DEBUG] fetch fallback to reader proxy url={url}");
+            }
+            if let Ok(v) = fetch_via_reader_proxy(client, &url, debug).await {
+                return Ok(v);
+            }
+            return Err(err).with_context(|| format!("fetch request failed: {url}"));
+        }
+    };
     let status = response.status();
     let final_url = response.url().to_string();
     let headers = response.headers().clone();
@@ -406,6 +413,16 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
         .context("failed to read fetched response body")?;
 
     if !status.is_success() {
+        if debug {
+            println!(
+                "[DEBUG] fetch primary non-success status={} url={} final={}",
+                status, url, final_url
+            );
+            println!("[DEBUG] fetch fallback to reader proxy url={url}");
+        }
+        if let Ok(v) = fetch_via_reader_proxy(client, &url, debug).await {
+            return Ok(v);
+        }
         bail!("fetch endpoint returned {status}: {body}");
     }
 
@@ -423,6 +440,17 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
         } else {
             title
         };
+
+        if should_fallback_to_reader(&body, &text) {
+            if debug {
+                println!("[DEBUG] fetch primary looks blocked/js-gated url={url} final={final_url}");
+                println!("[DEBUG] fetch fallback to reader proxy url={url}");
+            }
+            if let Ok(v) = fetch_via_reader_proxy(client, &url, debug).await {
+                return Ok(v);
+            }
+        }
+
         let redirect_note = redirect_note(&url, &final_url);
         return Ok(format!(
             "URL Requested: {url}\nURL Final: {final_url}\n{redirect_note}Title: {title}\nContent:\n{text}"
@@ -434,6 +462,152 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
     Ok(format!(
         "URL Requested: {url}\nURL Final: {final_url}\n{redirect_note}Content:\n{text}"
     ))
+}
+
+async fn fetch_with_browser_profile(client: &Client, url: &str) -> Result<reqwest::Response> {
+    client
+        .get(url)
+        .header("User-Agent", DEFAULT_UA)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .header("Sec-CH-UA", BROWSER_SEC_CH_UA)
+        .header("Sec-CH-UA-Mobile", "?0")
+        .header("Sec-CH-UA-Platform", "\"macOS\"")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Upgrade-Insecure-Requests", "1")
+        .send()
+        .await
+        .context("browser-profile request failed")
+}
+
+fn should_fallback_to_reader(body: &str, extracted_text: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let blocked_markers = [
+        "javascript is not available",
+        "enable javascript",
+        "please enable javascript",
+        "errorcontainer",
+        "please turn javascript on",
+        "verify you are human",
+        "are you a robot",
+        "are you human",
+        "checking your browser",
+        "access denied",
+        "attention required",
+        "just a moment",
+        "cloudflare",
+        "bot challenge",
+        "security check",
+        "human verification",
+        "请开启 javascript",
+        "请启用 javascript",
+        "需要启用 javascript",
+    ];
+    if blocked_markers.iter().any(|v| lower.contains(v)) {
+        return true;
+    }
+
+    let text_len = extracted_text.chars().count();
+    let script_count = lower.match_indices("<script").count();
+    text_len < 180 && script_count >= 8
+}
+
+async fn fetch_via_reader_proxy(client: &Client, url: &str, debug: bool) -> Result<String> {
+    let candidates = build_reader_proxy_candidates(url);
+    for candidate in candidates {
+        let response = match client
+            .get(&candidate)
+            .header("User-Agent", DEFAULT_UA)
+            .header("Accept", "text/plain,text/markdown;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                if debug {
+                    println!(
+                        "[DEBUG] fetch.reader request failed candidate={} err={}",
+                        candidate, err
+                    );
+                }
+                continue;
+            }
+        };
+
+        let status = response.status();
+        let final_url = response.url().to_string();
+        let body = match response.text().await {
+            Ok(v) => v,
+            Err(err) => {
+                if debug {
+                    println!(
+                        "[DEBUG] fetch.reader read body failed candidate={} err={}",
+                        candidate, err
+                    );
+                }
+                continue;
+            }
+        };
+
+        if !status.is_success() {
+            if debug {
+                println!(
+                    "[DEBUG] fetch.reader non-success status={} candidate={}",
+                    status, candidate
+                );
+            }
+            continue;
+        }
+
+        let text = truncate_text(&normalize_whitespace(&body), MAX_FETCH_CHARS);
+        if text.is_empty() {
+            continue;
+        }
+
+        if debug {
+            println!(
+                "[DEBUG] fetch.reader success candidate={} final={} chars={}",
+                candidate,
+                final_url,
+                text.chars().count()
+            );
+        }
+
+        let redirect = redirect_note(url, &final_url);
+        return Ok(format!(
+            "URL Requested: {url}\nURL Final: {final_url}\nFetch Mode: reader_proxy\n{redirect}Content:\n{text}"
+        ));
+    }
+
+    bail!("reader proxy fallback failed for url: {url}")
+}
+
+fn build_reader_proxy_candidates(url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(format!("https://r.jina.ai/{url}"));
+    if let Some(with_http) = reader_http_style_url(url) {
+        out.push(format!("https://r.jina.ai/{with_http}"));
+    }
+    out
+}
+
+fn reader_http_style_url(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return Some(format!("http://{rest}"));
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        return Some(format!("http://{rest}"));
+    }
+    None
 }
 
 pub fn extract_urls(text: &str) -> Vec<String> {

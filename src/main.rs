@@ -337,7 +337,8 @@ fn handle_incoming_payload(
     let bridge = bridge.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
-        if let Some(action_text) = process_incoming(&state, &bridge, value).await {
+        let action_texts = process_incoming(&state, &bridge, value).await;
+        for action_text in action_texts {
             let _ = tx.send(action_text);
         }
     });
@@ -347,16 +348,16 @@ async fn process_incoming(
     state: &AppState,
     bridge: &WsActionBridge,
     payload: Value,
-) -> Option<String> {
+) -> Vec<String> {
     if payload.get("post_type").and_then(Value::as_str) != Some("message") {
-        return None;
+        return Vec::new();
     }
 
     let mut event: MessageEvent = match serde_json::from_value(payload) {
         Ok(v) => v,
         Err(err) => {
             log_error(format!("invalid message event: {err}"));
-            return None;
+            return Vec::new();
         }
     };
 
@@ -378,18 +379,24 @@ async fn process_incoming(
     );
 
     if let Some(action) = try_reload_config_command(state, &event, &config).await {
-        return serde_json::to_string(&action).ok();
+        return serde_json::to_string(&action)
+            .ok()
+            .into_iter()
+            .collect();
     }
 
-    let action = match router.route_message(event).await {
+    let actions = match router.route_message(event).await {
         Ok(action) => action,
         Err(err) => {
             log_error(format!("route message failed: {err}"));
-            return None;
+            return Vec::new();
         }
     };
 
-    action.and_then(|v| serde_json::to_string(&v).ok())
+    actions
+        .into_iter()
+        .filter_map(|v| serde_json::to_string(&v).ok())
+        .collect()
 }
 
 struct ReloadOutcome {

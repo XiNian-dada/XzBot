@@ -129,7 +129,7 @@ Plugins/
 ```
 
 通信方式：stdin/stdout 按行 JSON（必须回传 `request_id`）。
-插件可返回 `file_path` 以发送文件（适合长报告）。
+插件可返回 `file_path` 以发送文件（适合长报告），也可返回 `image_path` / `image_url` 发送图片（CQ 码）。
 `/reload` 可重新扫描 `Plugins/` 并重启插件进程。
 插件 stderr 会转发到 XzBot 控制台日志。
 
