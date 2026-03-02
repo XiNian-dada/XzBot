@@ -1,3 +1,5 @@
+//! Application entrypoint, websocket server lifecycle and message pipeline.
+
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -51,6 +53,7 @@ mod store;
 mod token_stats;
 mod tools;
 
+/// Shared application state stored in axum router.
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<RwLock<RuntimeState>>,
@@ -58,11 +61,13 @@ struct AppState {
     store: Arc<MemoryStore>,
 }
 
+/// Live runtime object that can be atomically swapped on `/reload`.
 struct RuntimeState {
     router: Arc<BotRouter>,
     config: Arc<Config>,
 }
 
+/// Bridge for sending OneBot actions and awaiting async action responses.
 #[derive(Clone)]
 struct WsActionBridge {
     action_tx: mpsc::UnboundedSender<String>,
@@ -72,6 +77,7 @@ struct WsActionBridge {
 }
 
 impl WsActionBridge {
+    /// Creates a new bridge bound to outbound websocket sender.
     fn new(action_tx: mpsc::UnboundedSender<String>, debug: bool) -> Self {
         Self {
             action_tx,
@@ -81,6 +87,7 @@ impl WsActionBridge {
         }
     }
 
+    /// Dispatches incoming non-event payload to pending action waiter by `echo`.
     fn try_dispatch_response(&self, payload: &Value) -> bool {
         if payload.get("post_type").is_some() {
             return false;
@@ -102,6 +109,7 @@ impl WsActionBridge {
         false
     }
 
+    /// Sends one OneBot action and waits for echoed response.
     async fn call_action(&self, action: &str, params: Value) -> anyhow::Result<Value> {
         let echo = format!("xzbot-echo-{}", self.seq.fetch_add(1, Ordering::Relaxed));
         let request = json!({
@@ -129,6 +137,7 @@ impl WsActionBridge {
 }
 
 #[tokio::main]
+/// Process entrypoint: load config/runtime, start websocket server.
 async fn main() -> anyhow::Result<()> {
     let exe_path = std::env::current_exe().context("failed to get current executable path")?;
     let exe_dir = exe_path
@@ -171,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Builds runtime components from config/store/plugins.
 fn build_runtime(
     config: Arc<Config>,
     store: Arc<MemoryStore>,
@@ -202,6 +212,7 @@ fn build_runtime(
     Ok(RuntimeState { router, config })
 }
 
+/// Performs startup proxy connectivity check when proxy is enabled.
 async fn check_proxy_availability(config: &NetworkConfig) -> anyhow::Result<()> {
     if !config.proxy_enabled {
         return Ok(());
@@ -226,6 +237,7 @@ async fn check_proxy_availability(config: &NetworkConfig) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Axum websocket upgrade handler with optional token verification.
 async fn onebot_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -250,6 +262,7 @@ async fn onebot_ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+/// One websocket connection lifecycle (reader loop + writer task).
 async fn handle_socket(socket: WebSocket, state: AppState) {
     log_info("websocket connected");
     let (mut sender, mut receiver) = socket.split();
@@ -315,6 +328,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     log_info("websocket disconnected");
 }
 
+/// Parses one websocket text payload and dispatches async event processing.
 fn handle_incoming_payload(
     payload: &str,
     state: &AppState,
@@ -344,6 +358,7 @@ fn handle_incoming_payload(
     });
 }
 
+/// Parses one OneBot payload and routes to bot runtime.
 async fn process_incoming(
     state: &AppState,
     bridge: &WsActionBridge,
@@ -399,12 +414,14 @@ async fn process_incoming(
         .collect()
 }
 
+/// Outcome object returned by runtime reload.
 struct ReloadOutcome {
     config: Arc<Config>,
     server_rebind_required: bool,
     plugin_names: Vec<String>,
 }
 
+/// Handles owner `/reload` command and returns immediate status action.
 async fn try_reload_config_command(
     state: &AppState,
     event: &MessageEvent,
@@ -452,6 +469,7 @@ async fn try_reload_config_command(
     }
 }
 
+/// Checks whether current event is owner-issued reload command.
 fn is_reload_command(event: &MessageEvent, owner_qq: i64) -> bool {
     if event.user_id != owner_qq {
         return false;
@@ -475,6 +493,7 @@ fn is_reload_command(event: &MessageEvent, owner_qq: i64) -> bool {
     text.replace(&at_me, "").trim() == "/reload"
 }
 
+/// Builds reply action for reload status message.
 fn reload_reply_action(event: &MessageEvent, message: String) -> ActionRequest {
     if event.message_type == "group" {
         if let Some(group_id) = event.group_id {
@@ -487,6 +506,7 @@ fn reload_reply_action(event: &MessageEvent, message: String) -> ActionRequest {
     ActionRequest::send_private_msg(event.user_id, message)
 }
 
+/// Reloads config and plugin runtime without process restart.
 async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
     let config_path = state.config_path.as_ref();
     let new_config = Arc::new(Config::load(config_path)?);
@@ -514,6 +534,7 @@ async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
     })
 }
 
+/// Enriches incoming event with resolvable image URLs and quoted message text context.
 async fn enrich_event_images(
     event: &mut MessageEvent,
     bridge: &WsActionBridge,
@@ -625,6 +646,7 @@ async fn enrich_event_images(
     Ok(())
 }
 
+/// Extracts readable quote text from `get_msg` response payload.
 fn extract_quote_text_from_message_data(data: &Value) -> Option<String> {
     if let Some(message) = data.get("message") {
         if let Some(text) = message_value_to_text(message) {
@@ -640,6 +662,7 @@ fn extract_quote_text_from_message_data(data: &Value) -> Option<String> {
         .filter(|v| !v.trim().is_empty())
 }
 
+/// Converts OneBot `message` field (string or segments) into plain text.
 fn message_value_to_text(message: &Value) -> Option<String> {
     match message {
         Value::String(raw) => {
@@ -698,6 +721,7 @@ fn message_value_to_text(message: &Value) -> Option<String> {
     }
 }
 
+/// Removes CQ segments and keeps plain text/image placeholders.
 fn strip_cq_to_text(raw: &str) -> String {
     let mut out = String::new();
     let mut cursor = 0;
@@ -726,6 +750,7 @@ fn strip_cq_to_text(raw: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Trims long quote context for prompt safety.
 fn trim_for_context(text: &str, max_chars: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_chars {
@@ -734,6 +759,7 @@ fn trim_for_context(text: &str, max_chars: usize) -> String {
     chars.into_iter().take(max_chars).collect::<String>() + "...(truncated)"
 }
 
+/// Resolves image reference to URL/file by optionally calling OneBot `get_image`.
 async fn resolve_image_url(
     bridge: &WsActionBridge,
     image_ref: &str,
@@ -791,6 +817,7 @@ async fn resolve_image_url(
     None
 }
 
+/// Collects image URL/file refs from message data payload.
 fn collect_image_refs_from_message_data(data: &Value) -> (Vec<String>, Vec<String>) {
     let mut urls = Vec::new();
     let mut files = Vec::new();
@@ -827,6 +854,7 @@ fn collect_image_refs_from_message_data(data: &Value) -> (Vec<String>, Vec<Strin
     (urls, files)
 }
 
+/// Helper for parsing image refs from one `message` value variant.
 fn collect_image_refs_from_message_value(
     message: &Value,
     urls: &mut Vec<String>,
@@ -877,14 +905,17 @@ fn collect_image_refs_from_message_value(
     }
 }
 
+/// Returns true when value looks like HTTP(S) URL.
 fn looks_like_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+/// Returns true when value looks like absolute local path.
 fn looks_like_local_path(value: &str) -> bool {
     value.starts_with('/') || value.contains(":\\")
 }
 
+/// Normalizes image reference string from CQ payload fields.
 fn normalize_image_ref(value: &str) -> String {
     value
         .trim()
@@ -894,6 +925,7 @@ fn normalize_image_ref(value: &str) -> String {
         .replace("&#38;", "&")
 }
 
+/// Extracts access token from headers or query params.
 fn extract_access_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
     if let Some(token) = header_token(headers, "authorization") {
         if let Some(bearer) = token.strip_prefix("Bearer ") {
@@ -928,6 +960,7 @@ fn extract_access_token(headers: &HeaderMap, query: &HashMap<String, String>) ->
     None
 }
 
+/// Reads one header value as string.
 fn header_token(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)

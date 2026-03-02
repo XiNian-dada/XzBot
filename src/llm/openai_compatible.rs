@@ -1,3 +1,5 @@
+//! OpenAI-compatible backend with tool-calling, vision fallback and retries.
+
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,6 +23,7 @@ use crate::{
     },
 };
 
+/// OpenAI-compatible LLM implementation used by the bot runtime.
 pub struct OpenAiCompatibleLlm {
     client: reqwest::Client,
     endpoint: String,
@@ -38,6 +41,7 @@ pub struct OpenAiCompatibleLlm {
 }
 
 impl OpenAiCompatibleLlm {
+    /// Performs one continuation call when provider truncated output by token limit.
     async fn maybe_continue_if_truncated(
         &self,
         session_id: String,
@@ -93,6 +97,8 @@ impl OpenAiCompatibleLlm {
 
         Ok((format!("{reply}\n{continued}"), true))
     }
+
+    /// Builds provider client/runtime settings from global AI config.
     pub fn from_config(
         config: &AiConfig,
         search: &SearchConfig,
@@ -140,6 +146,7 @@ impl OpenAiCompatibleLlm {
 
 #[async_trait]
 impl Llm for OpenAiCompatibleLlm {
+    /// Runs one full chat turn with tool mode and plain fallback.
     async fn chat(
         &self,
         session_id: String,
@@ -180,6 +187,7 @@ impl Llm for OpenAiCompatibleLlm {
 }
 
 impl OpenAiCompatibleLlm {
+    /// Executes iterative OpenAI tool-call loop and returns final answer.
     async fn chat_with_function_calls(
         &self,
         session_id: String,
@@ -190,6 +198,7 @@ impl OpenAiCompatibleLlm {
         let mut executed_tool_signatures = HashSet::new();
 
         for round in 0..=MAX_TOOL_ROUNDS {
+            // Some gateways require all system messages to be merged at the beginning.
             normalize_system_messages(&mut messages);
             let stage = if has_openai_tool_results(&messages) {
                 "final_answer"
@@ -992,6 +1001,7 @@ fn weather_intent_from_text(lower: &str) -> bool {
 }
 
 fn search_result_looks_empty(text: &str) -> bool {
+    // Treat these phrases as low-value/empty retrieval so weather can fallback to API.
     let t = text.trim();
     t.is_empty()
         || t.contains("未在")
@@ -1335,6 +1345,8 @@ fn infer_tool_call_from_recent_user(messages: &[Value], round: usize) -> Option<
         || lower.contains("温度")
         || lower.contains("下雨")
     {
+        // For weather intent we ask search first (multi-day forecast pages), then
+        // get_weather is used only as fallback when search is empty/failed.
         let location = extract_weather_location_hint(&user_text);
         let weather_query = if location.trim().is_empty() {
             user_text.clone()

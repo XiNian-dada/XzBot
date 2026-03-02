@@ -1,3 +1,5 @@
+//! Weather tool: current conditions API + web forecast reference synthesis.
+
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use scraper::{Html, Selector};
@@ -6,9 +8,12 @@ use serde_json::Value;
 const DEFAULT_UA: &str = "Mozilla/5.0 (compatible; XzBot/1.0; +https://example.local)";
 const BROWSER_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+// Preferred multi-day weather source when web results are available.
 const PREFERRED_WEATHER_DOMAIN: &str = "tianqi.2345.com";
 const MAX_WEATHER_REF_CHARS: usize = 1200;
 
+// Returns current weather from API and appends a web-based multi-day reference.
+/// Returns current weather and optionally appends multi-day web forecast hints.
 pub async fn get_weather(client: &Client, location: &str, debug: bool) -> Result<String> {
     let location = location.trim();
     if location.is_empty() {
@@ -248,6 +253,7 @@ struct WeatherCandidate {
 }
 
 async fn fetch_weather_reference(client: &Client, location: &str, debug: bool) -> Result<String> {
+    // Use a weather-oriented query so the search result contains week/15-day/30-day pages.
     let query = format!("{location} 天气 15天 30天");
     let encoded = urlencoding::encode(&query);
     let search_url = format!("https://cn.bing.com/search?q={encoded}&setlang=zh-Hans&cc=CN");
@@ -310,6 +316,7 @@ async fn fetch_weather_reference(client: &Client, location: &str, debug: bool) -
 }
 
 fn parse_bing_weather_candidates(html: &str) -> Result<Vec<WeatherCandidate>> {
+    // Reuse Bing result blocks and extract title + target URL.
     let doc = Html::parse_document(html);
     let item_sel = Selector::parse("li.b_algo")
         .map_err(|err| anyhow::anyhow!("failed to parse selector li.b_algo: {err}"))?;
@@ -339,6 +346,7 @@ fn parse_bing_weather_candidates(html: &str) -> Result<Vec<WeatherCandidate>> {
 }
 
 fn normalize_weather_result_url(url: &str) -> String {
+    // Keep only normal http(s) targets and drop Bing jump/utility hosts.
     let trimmed = url.trim();
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return String::new();
@@ -357,6 +365,7 @@ fn normalize_weather_result_url(url: &str) -> String {
 }
 
 fn pick_weather_candidate(candidates: Vec<WeatherCandidate>) -> Option<WeatherCandidate> {
+    // Always try preferred domain first, then fallback to first valid hit.
     if let Some(hit) = candidates
         .iter()
         .find(|c| is_preferred_weather_domain(&c.url))
@@ -375,12 +384,14 @@ fn is_preferred_weather_domain(url: &str) -> bool {
 }
 
 fn host_of(url: &str) -> Option<String> {
+    // Host normalization is used for domain-priority matching.
     reqwest::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|v| v.to_ascii_lowercase()))
 }
 
 async fn fetch_weather_page_summary(client: &Client, url: &str) -> Result<(String, String)> {
+    // Fetch the source page and return normalized textual summary.
     let response = client
         .get(url)
         .header("User-Agent", BROWSER_UA)
@@ -407,6 +418,7 @@ async fn fetch_weather_page_summary(client: &Client, url: &str) -> Result<(Strin
 }
 
 fn extract_html_title_text(html: &str) -> Result<(String, String)> {
+    // Keep extraction intentionally simple: title + full body text normalization.
     let doc = Html::parse_document(html);
     let body_sel =
         Selector::parse("body").map_err(|err| anyhow::anyhow!("failed to parse selector body: {err}"))?;
@@ -432,6 +444,7 @@ fn extract_html_title_text(html: &str) -> Result<(String, String)> {
 }
 
 fn normalize_whitespace(text: &str) -> String {
+    // Keep output compact for tool payload size control.
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

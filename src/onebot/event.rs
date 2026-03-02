@@ -1,26 +1,40 @@
+//! OneBot v11 event models and message parsing helpers.
+
 use serde::Deserialize;
 use serde_json::Value;
 
+/// Minimal message event fields used by the bot runtime.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageEvent {
+    /// OneBot post type, only `message` is handled by router.
     pub post_type: String,
+    /// `private` or `group`.
     pub message_type: String,
+    /// Bot QQ id.
     pub self_id: i64,
+    /// Sender QQ id.
     pub user_id: i64,
+    /// Sender profile info.
     #[serde(default)]
     pub sender: SenderInfo,
+    /// Group id for group messages.
     #[serde(default)]
     pub group_id: Option<i64>,
+    /// Raw CQ-coded text.
     #[serde(default)]
     pub raw_message: String,
+    /// Structured message payload when provider sends segment array.
     #[serde(default)]
     pub message: MessagePayload,
 }
 
+/// Message payload variants used by different OneBot implementations.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum MessagePayload {
+    /// Plain text payload.
     Text(String),
+    /// Segment payload (`text`, `at`, `image`, ...).
     Segments(Vec<MessageSegment>),
 }
 
@@ -30,22 +44,29 @@ impl Default for MessagePayload {
     }
 }
 
+/// One segment inside structured message payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageSegment {
+    /// Segment type.
     #[serde(rename = "type")]
     pub kind: String,
+    /// Segment data map.
     #[serde(default)]
     pub data: Value,
 }
 
+/// Sender display metadata.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SenderInfo {
+    /// QQ nickname.
     #[serde(default)]
     pub nickname: String,
+    /// Group card.
     #[serde(default)]
     pub card: String,
 }
 
+/// Parsed CQ image reference with optional url/file fields.
 #[derive(Debug, Clone)]
 pub struct CqImageRef {
     pub url: Option<String>,
@@ -53,6 +74,7 @@ pub struct CqImageRef {
 }
 
 impl MessageEvent {
+    /// Returns normalized text with image markers merged from segments and raw CQ message.
     pub fn text(&self) -> String {
         // 优先使用结构化消息段，图片/at 等内容在这里更完整。
         if let MessagePayload::Segments(segments) = &self.message {
@@ -95,6 +117,7 @@ impl MessageEvent {
         String::new()
     }
 
+    /// Returns best-effort sender display name.
     pub fn display_name(&self) -> String {
         // 群聊优先用群名片，私聊/兜底用昵称，最终回退到 QQ 号。
         if self.message_type == "group" {
@@ -112,6 +135,7 @@ impl MessageEvent {
         self.user_id.to_string()
     }
 
+    /// Returns deduplicated image file ids in current event.
     pub fn image_file_ids(&self) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -141,6 +165,7 @@ impl MessageEvent {
         out
     }
 
+    /// Returns deduplicated replied message ids in current event.
     pub fn reply_message_ids(&self) -> Vec<i64> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -168,6 +193,7 @@ impl MessageEvent {
     }
 }
 
+/// Converts segment array into normalized message text.
 fn segments_to_text(segments: &[MessageSegment]) -> String {
     let mut out = String::new();
 
@@ -205,6 +231,7 @@ fn segments_to_text(segments: &[MessageSegment]) -> String {
     out
 }
 
+/// Extracts `[CQ:image,...]` references from raw message.
 pub fn extract_cq_image_refs(raw: &str) -> Vec<CqImageRef> {
     let mut out = Vec::new();
     let mut cursor = 0;
@@ -249,6 +276,7 @@ pub fn extract_cq_image_refs(raw: &str) -> Vec<CqImageRef> {
     out
 }
 
+/// Extracts `[CQ:reply,id=...]` ids from raw message.
 pub fn extract_cq_reply_ids(raw: &str) -> Vec<i64> {
     let mut out = Vec::new();
     let mut cursor = 0;
@@ -283,6 +311,7 @@ pub fn extract_cq_reply_ids(raw: &str) -> Vec<i64> {
     out
 }
 
+/// Encodes parsed image reference into normalized internal marker.
 fn image_ref_to_marker(image_ref: &CqImageRef) -> String {
     // 优先保留 url，避免同时携带 file 导致后续重复加载/无效 file 引用。
     match (&image_ref.url, &image_ref.file) {
@@ -293,6 +322,7 @@ fn image_ref_to_marker(image_ref: &CqImageRef) -> String {
     }
 }
 
+/// Reads i64 from either numeric JSON or string JSON.
 fn extract_i64_from_value(value: Option<&Value>) -> Option<i64> {
     let value = value?;
     if let Some(v) = value.as_i64() {
@@ -304,6 +334,7 @@ fn extract_i64_from_value(value: Option<&Value>) -> Option<i64> {
     None
 }
 
+/// Normalizes escaped/quoted image reference values from CQ fields.
 fn normalize_image_ref_value(value: &str) -> String {
     value
         .trim()
@@ -313,6 +344,7 @@ fn normalize_image_ref_value(value: &str) -> String {
         .replace("&#38;", "&")
 }
 
+/// Checks whether a normalized marker already exists in text.
 fn contains_image_ref_marker(text: &str, image_ref: &CqImageRef) -> bool {
     let url_hit = image_ref
         .url

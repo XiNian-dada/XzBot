@@ -1,3 +1,5 @@
+//! Managed external plugin runtime and IPC bridge.
+
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -26,6 +28,7 @@ use crate::{
 const DEFAULT_PLUGIN_TIMEOUT_MS: u64 = 15_000;
 const MANIFEST_ARG: &str = "--manifest";
 
+/// Plugin runtime manager that discovers binaries and dispatches slash commands.
 #[derive(Debug, Clone)]
 pub struct PluginManager {
     plugins: Vec<ManagedPlugin>,
@@ -34,6 +37,7 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
+    /// Loads plugin binaries from `root` and builds command index.
     pub fn load_from_dir(root: &Path, config: Arc<Config>) -> Result<Self> {
         if !root.exists() {
             fs::create_dir_all(root)
@@ -81,20 +85,24 @@ impl PluginManager {
         })
     }
 
+    /// Returns currently loaded plugin count.
     pub fn plugin_count(&self) -> usize {
         self.plugins.len()
     }
 
+    /// Returns plugin names for diagnostics/logging.
     pub fn plugin_names(&self) -> Vec<String> {
         self.plugins.iter().map(|p| p.name.clone()).collect()
     }
 
+    /// Stops all plugin processes.
     pub async fn shutdown(&self) {
         for plugin in &self.plugins {
             plugin.shutdown(self.config.debug).await;
         }
     }
 
+    /// Tries to route an event to a plugin command and converts plugin output to actions.
     pub async fn try_handle(&self, event: &MessageEvent) -> Result<Vec<ActionRequest>> {
         let raw_text = event.text();
         let at_me = format!("[CQ:at,qq={}]", event.self_id);
@@ -221,6 +229,7 @@ impl PluginManager {
     }
 }
 
+/// Metadata returned by plugin executable via `--manifest`.
 #[derive(Debug, Deserialize)]
 struct PluginManifestInfo {
     name: String,
@@ -230,6 +239,7 @@ struct PluginManifestInfo {
     timeout_ms: Option<u64>,
 }
 
+/// Runtime handle for one managed plugin process.
 #[derive(Debug, Clone)]
 struct ManagedPlugin {
     name: String,
@@ -242,6 +252,7 @@ struct ManagedPlugin {
 }
 
 impl ManagedPlugin {
+    /// Constructs managed plugin runtime state from manifest.
     fn new(path: PathBuf, manifest: PluginManifestInfo, root: &Path) -> Result<Self> {
         let name = manifest.name.trim().to_string();
         let commands = manifest
@@ -273,10 +284,12 @@ impl ManagedPlugin {
         })
     }
 
+    /// Allocates monotonically increasing request id for IPC correlation.
     fn next_request_id(&self) -> String {
         format!("{}-{}", self.name, self.seq.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Sends one IPC request to plugin process and waits for response.
     async fn call(&self, request: PluginRequest, debug: bool) -> Result<PluginResponse> {
         let mut guard = self.process.lock().await;
         let process = ensure_process(&self.path, guard.take(), debug).await?;
@@ -307,6 +320,7 @@ impl ManagedPlugin {
         response
     }
 
+    /// Terminates plugin process if running.
     async fn shutdown(&self, debug: bool) {
         let mut guard = self.process.lock().await;
         let Some(mut proc) = guard.take() else {
@@ -323,6 +337,7 @@ impl ManagedPlugin {
     }
 }
 
+/// Live child process handles kept across calls.
 #[derive(Debug)]
 struct PluginProcess {
     child: Child,
@@ -330,6 +345,7 @@ struct PluginProcess {
     stdout: BufReader<ChildStdout>,
 }
 
+/// Ensures plugin process is running, restarting when exited.
 async fn ensure_process(
     path: &Path,
     mut existing: Option<PluginProcess>,
@@ -381,6 +397,7 @@ async fn ensure_process(
     })
 }
 
+/// Pipes plugin stderr into bot logs for debugging.
 fn spawn_plugin_log_task(name: String, stderr: ChildStderr) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
@@ -405,6 +422,7 @@ fn spawn_plugin_log_task(name: String, stderr: ChildStderr) {
     });
 }
 
+/// Reads one response line from plugin stdout with timeout.
 async fn read_response(
     stdout: &mut BufReader<ChildStdout>,
     request_id: &str,
@@ -450,6 +468,7 @@ async fn read_response(
         .map_err(|_| anyhow!("plugin timeout after {} ms", timeout_ms))?
 }
 
+/// IPC request payload sent from host to plugin.
 #[derive(Debug, Serialize)]
 struct PluginRequest {
     request_id: String,
@@ -463,6 +482,7 @@ struct PluginRequest {
     config_dir: String,
 }
 
+/// IPC response payload returned by plugin.
 #[derive(Debug, Deserialize)]
 struct PluginResponse {
     #[serde(default)]
@@ -480,6 +500,7 @@ struct PluginResponse {
     image_url: Option<String>,
 }
 
+/// Runs plugin with `--manifest` and parses manifest JSON.
 fn read_plugin_manifest(path: &Path) -> Option<PluginManifestInfo> {
     let output = std::process::Command::new(path)
         .arg(MANIFEST_ARG)
@@ -492,6 +513,7 @@ fn read_plugin_manifest(path: &Path) -> Option<PluginManifestInfo> {
     serde_json::from_str(stdout.trim()).ok()
 }
 
+/// Parses slash command and argument string from normalized text.
 fn parse_command(text: &str) -> Option<(String, String)> {
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
@@ -506,6 +528,7 @@ fn parse_command(text: &str) -> Option<(String, String)> {
     Some((head.to_lowercase(), args))
 }
 
+/// Resolves plugin-relative output paths against plugin config directory.
 fn resolve_plugin_path(path: &str, config_dir: &Path) -> PathBuf {
     let p = Path::new(path.trim());
     if p.is_absolute() {

@@ -1,3 +1,5 @@
+//! High-level message routing: permission check, plugins, AI fallback.
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,6 +13,7 @@ use crate::{
     plugins::PluginManager,
 };
 
+/// Central router that dispatches events to plugins or AI chat.
 pub struct BotRouter {
     ai_chat: AiChatPlugin,
     plugins: PluginManager,
@@ -20,6 +23,7 @@ pub struct BotRouter {
 }
 
 impl BotRouter {
+    /// Builds a router with runtime state initialized from config.
     pub fn new(ai_chat: AiChatPlugin, plugins: PluginManager, config: Arc<Config>) -> Self {
         let runtime_group_blacklist = DashSet::new();
         for &group_id in &config.group.blacklist {
@@ -35,6 +39,7 @@ impl BotRouter {
         }
     }
 
+    /// Routes one incoming message event to zero or more OneBot actions.
     pub async fn route_message(&self, event: MessageEvent) -> Result<Vec<ActionRequest>> {
         if event.post_type != "message" {
             log_debug(
@@ -93,10 +98,12 @@ impl BotRouter {
         Ok(self.ai_chat.handle_message(event).await?.into_iter().collect())
     }
 
+    /// Gracefully shuts down all managed plugins.
     pub async fn shutdown_plugins(&self) {
         self.plugins.shutdown().await;
     }
 
+    /// Applies permission and group blacklist policy.
     fn allowed_by_permission(&self, event: &MessageEvent) -> bool {
         if event.message_type == "group" {
             let Some(group_id) = event.group_id else {
@@ -127,6 +134,7 @@ impl BotRouter {
         }
     }
 
+    /// Evaluates group trigger policy (`@`, prefix, keyword, mixed).
     fn should_trigger_group(&self, event: &MessageEvent) -> bool {
         let raw_text = event.text();
         let at_me = format!("[CQ:at,qq={}]", event.self_id);
@@ -167,6 +175,7 @@ impl BotRouter {
         }
     }
 
+    /// Handles runtime `/blacklist` management command.
     fn handle_blacklist_command(&self, event: &MessageEvent) -> Option<ActionRequest> {
         let text = normalize_command_text(event);
         let command = parse_blacklist_command(&text)?;
@@ -236,6 +245,7 @@ impl BotRouter {
         }
     }
 
+    /// Implements group "加一" behavior with per-group mute-after-repeat state.
     fn try_group_repeat(&self, event: &MessageEvent) -> Option<ActionRequest> {
         if event.message_type != "group" {
             return None;
@@ -289,6 +299,7 @@ impl BotRouter {
         None
     }
 
+    /// Builds reply action according to source chat type.
     fn reply_to_event(&self, event: &MessageEvent, message: String) -> ActionRequest {
         match event.message_type.as_str() {
             "group" => {
@@ -305,11 +316,15 @@ impl BotRouter {
 
 #[derive(Debug, Clone, Default)]
 struct GroupRepeatState {
+    /// Most recent normalized text.
     last_text: Option<String>,
+    /// Text already echoed once and temporarily muted.
     muted_text: Option<String>,
+    /// Consecutive count for current `last_text`.
     streak: u32,
 }
 
+/// Supported `/blacklist` command variants.
 #[derive(Debug, Clone, Copy)]
 enum BlacklistCommand {
     Add(Option<i64>),
@@ -317,6 +332,7 @@ enum BlacklistCommand {
     List,
 }
 
+/// Normalizes command text by stripping bot mention in groups.
 fn normalize_command_text(event: &MessageEvent) -> String {
     let raw = event.text();
     if event.message_type == "group" {
@@ -327,6 +343,7 @@ fn normalize_command_text(event: &MessageEvent) -> String {
     }
 }
 
+/// Parses `/blacklist` command and optional target group id.
 fn parse_blacklist_command(text: &str) -> Option<BlacklistCommand> {
     let mut parts = text.split_whitespace();
     let head = parts.next()?;
@@ -347,6 +364,7 @@ fn parse_blacklist_command(text: &str) -> Option<BlacklistCommand> {
     }
 }
 
+/// Keyword matching with lightweight word-boundary check and case-insensitive fallback.
 fn keyword_match_with_boundary(text: &str, keyword: &str) -> bool {
     if keyword.trim().is_empty() {
         return false;
@@ -361,6 +379,7 @@ fn keyword_match_with_boundary(text: &str, keyword: &str) -> bool {
     match_with_boundary(&text_lower, &keyword_lower)
 }
 
+/// Returns normalized text used by group repeat feature.
 fn normalize_repeat_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -373,6 +392,7 @@ fn normalize_repeat_text(text: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// Checks whether `keyword` occurs with both-side boundary constraints.
 fn match_with_boundary(text: &str, keyword: &str) -> bool {
     for (idx, _) in text.match_indices(keyword) {
         let start_ok = idx == 0
@@ -396,6 +416,7 @@ fn match_with_boundary(text: &str, keyword: &str) -> bool {
     false
 }
 
+/// Returns true when char should be treated as token boundary.
 fn is_word_boundary(ch: char) -> bool {
     !ch.is_alphanumeric() && ch != '_'
 }

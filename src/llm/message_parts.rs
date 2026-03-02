@@ -1,12 +1,19 @@
+//! Helpers for splitting user content into text and image marker lists.
+
 use std::collections::HashSet;
 
+/// Parsed representation of user message containing text and image references.
 #[derive(Debug, Clone)]
 pub struct ParsedUserContent {
+    /// Text content with image markers replaced by `[图片]`.
     pub text: String,
+    /// Deduplicated image URLs extracted from markers.
     pub image_urls: Vec<String>,
+    /// Deduplicated image file ids extracted from markers.
     pub image_files: Vec<String>,
 }
 
+/// Parses internal `[IMAGE:...]` markers out of user content.
 pub fn parse_user_content(raw: &str) -> ParsedUserContent {
     let mut text = String::new();
     let mut image_urls = Vec::new();
@@ -50,6 +57,7 @@ pub fn parse_user_content(raw: &str) -> ParsedUserContent {
     }
 }
 
+/// Parses marker payload fields (`url=...`, `file=...`).
 fn parse_image_marker_payload(
     payload: &str,
     image_urls: &mut Vec<String>,
@@ -75,6 +83,7 @@ fn parse_image_marker_payload(
     }
 }
 
+/// Cleans and decodes one marker value.
 fn clean_marker_value(value: &str) -> String {
     let value = value
         .trim()
@@ -84,6 +93,7 @@ fn clean_marker_value(value: &str) -> String {
     decode_html_entities_basic(&value)
 }
 
+/// Decodes minimal HTML entities that commonly appear in CQ payloads.
 fn decode_html_entities_basic(input: &str) -> String {
     input
         .replace("&amp;", "&")
@@ -91,6 +101,7 @@ fn decode_html_entities_basic(input: &str) -> String {
         .replace("&quot;", "\"")
 }
 
+/// Compacts consecutive whitespace characters to single spaces.
 fn compact_spaces(input: &str) -> String {
     let mut out = String::new();
     let mut prev_space = false;

@@ -1,8 +1,11 @@
+//! System/process inspection helpers exposed to tool-calling.
+
 use anyhow::Result;
 use std::fs;
 
 use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
 
+/// Returns runtime metrics for current XzBot process.
 pub fn get_process_info() -> Result<String> {
     let pid = sysinfo::get_current_pid().map_err(|err| anyhow::anyhow!(err))?;
     let mut system = System::new_all();
@@ -62,6 +65,7 @@ struct ProcMemBytes {
     vms: Option<u64>,
 }
 
+/// Reads `/proc/self/status` memory fields when running on Linux.
 fn read_proc_self_mem_bytes() -> Option<ProcMemBytes> {
     let content = fs::read_to_string("/proc/self/status").ok()?;
     let mut rss_kb = None;
@@ -82,6 +86,7 @@ fn read_proc_self_mem_bytes() -> Option<ProcMemBytes> {
     })
 }
 
+/// Parses a Linux `kB` memory value line.
 fn parse_kb_value(input: &str) -> Option<u64> {
     let parts = input.split_whitespace().collect::<Vec<_>>();
     if parts.is_empty() {
@@ -96,6 +101,7 @@ struct CgroupMemory {
     max: Option<u64>,
 }
 
+/// Reads cgroup memory usage/limit from v2 or v1 paths.
 fn read_cgroup_memory() -> Option<CgroupMemory> {
     if let (Ok(current), Ok(max)) = (
         fs::read_to_string("/sys/fs/cgroup/memory.current"),
@@ -118,6 +124,7 @@ fn read_cgroup_memory() -> Option<CgroupMemory> {
     Some(CgroupMemory { current, max })
 }
 
+/// Returns system metrics for selected scope (`summary`, `cpu`, `memory`, ...).
 pub fn get_system_info(scope: &str) -> Result<String> {
     let mut system = System::new_all();
     system.refresh_all();
@@ -150,6 +157,7 @@ pub fn get_system_info(scope: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Builds compact system summary.
 fn summary(system: &System) -> String {
     let host = System::host_name().unwrap_or_else(|| "unknown".to_string());
     let os = System::name().unwrap_or_else(|| "unknown".to_string());
@@ -170,6 +178,7 @@ fn summary(system: &System) -> String {
     )
 }
 
+/// Builds static hardware information section.
 fn hardware_details(system: &System) -> String {
     let main_cpu = system.cpus().first();
     let cpu_model = main_cpu.map(|c| c.brand()).unwrap_or("unknown");
@@ -184,6 +193,7 @@ fn hardware_details(system: &System) -> String {
     )
 }
 
+/// Builds per-core CPU usage section.
 fn cpu_details(system: &System) -> String {
     let mut out = String::new();
     out.push_str("CPU Details\n");
@@ -213,6 +223,7 @@ fn cpu_details(system: &System) -> String {
     out.trim().to_string()
 }
 
+/// Builds memory/swap usage section.
 fn memory_details(system: &System) -> String {
     let total_memory = system.total_memory();
     let used_memory = system.used_memory();
@@ -236,6 +247,7 @@ fn memory_details(system: &System) -> String {
     )
 }
 
+/// Builds disk usage section.
 fn disk_details() -> String {
     let disks = Disks::new_with_refreshed_list();
     if disks.is_empty() {
@@ -265,6 +277,7 @@ fn disk_details() -> String {
     out.trim().to_string()
 }
 
+/// Builds network interfaces and traffic section.
 fn network_details() -> String {
     let networks = Networks::new_with_refreshed_list();
     if networks.is_empty() {
@@ -296,6 +309,7 @@ fn network_details() -> String {
     out.trim().to_string()
 }
 
+/// Builds load average section.
 fn load_details() -> String {
     let load = System::load_average();
     format!(
@@ -304,6 +318,7 @@ fn load_details() -> String {
     )
 }
 
+/// Builds uptime section.
 fn uptime_details() -> String {
     format!(
         "Uptime\nuptime: {}\nboot_time_epoch: {}",
@@ -312,6 +327,7 @@ fn uptime_details() -> String {
     )
 }
 
+/// Formats seconds to `Xd Xh Xm Xs`.
 fn format_uptime(total_seconds: u64) -> String {
     let days = total_seconds / 86_400;
     let hours = (total_seconds % 86_400) / 3_600;
@@ -320,6 +336,7 @@ fn format_uptime(total_seconds: u64) -> String {
     format!("{days}d {hours}h {minutes}m {seconds}s")
 }
 
+/// Formats bytes to human-readable string.
 fn format_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -340,6 +357,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Calculates percentage with zero-safe denominator.
 fn pct(part: u64, total: u64) -> f64 {
     if total == 0 {
         0.0

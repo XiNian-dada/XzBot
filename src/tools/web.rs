@@ -1,3 +1,5 @@
+//! Built-in web search and URL fetch tools with anti-bot resilience.
+
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use dashmap::DashMap;
@@ -36,6 +38,7 @@ struct CachedSearchResult {
 
 static SEARCH_RESULT_CACHE: OnceLock<DashMap<String, CachedSearchResult>> = OnceLock::new();
 
+/// Runs web search and returns a compact, model-friendly summary string.
 pub async fn search_web(
     client: &Client,
     query: &str,
@@ -381,6 +384,7 @@ pub async fn search_web(
     Ok(out)
 }
 
+/// Fetches URL content and extracts readable text with reader-proxy fallback.
 pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String> {
     let url = normalize_url_input(url);
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -468,6 +472,8 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
 }
 
 async fn fetch_with_browser_profile(client: &Client, url: &str) -> Result<reqwest::Response> {
+    // Use browser-like headers so sites that gate by client fingerprint are less likely to
+    // return placeholder/error shells.
     client
         .get(url)
         .header("User-Agent", DEFAULT_UA)
@@ -492,6 +498,7 @@ async fn fetch_with_browser_profile(client: &Client, url: &str) -> Result<reqwes
 }
 
 fn should_fallback_to_reader(body: &str, extracted_text: &str) -> bool {
+    // Heuristics for JS-gated or anti-bot pages where static extraction is unreliable.
     let lower = body.to_ascii_lowercase();
     let blocked_markers = [
         "javascript is not available",
@@ -524,6 +531,7 @@ fn should_fallback_to_reader(body: &str, extracted_text: &str) -> bool {
 }
 
 async fn fetch_via_reader_proxy(client: &Client, url: &str, debug: bool) -> Result<String> {
+    // Reader proxy is a generic fallback for dynamic pages and anti-bot front pages.
     let candidates = build_reader_proxy_candidates(url);
     for candidate in candidates {
         let response = match client
@@ -595,6 +603,7 @@ async fn fetch_via_reader_proxy(client: &Client, url: &str, debug: bool) -> Resu
 }
 
 fn build_reader_proxy_candidates(url: &str) -> Vec<String> {
+    // Try both direct URL and explicit http-style variant accepted by some reader gateways.
     let mut out = Vec::new();
     out.push(format!("https://r.jina.ai/{url}"));
     if let Some(with_http) = reader_http_style_url(url) {
@@ -613,6 +622,7 @@ fn reader_http_style_url(url: &str) -> Option<String> {
     None
 }
 
+/// Extracts and deduplicates URLs from plain text.
 pub fn extract_urls(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -1759,6 +1769,7 @@ fn take_unique_hits_preserve_order(hits: Vec<SearchHit>, limit: usize) -> Vec<Se
 }
 
 fn is_weather_query(query: &str) -> bool {
+    // Lightweight intent check used only for ranking tweaks in search output.
     let lower = query.to_lowercase();
     lower.contains("天气")
         || lower.contains("气温")
@@ -1769,6 +1780,10 @@ fn is_weather_query(query: &str) -> bool {
 }
 
 fn reorder_weather_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    // Ranking order:
+    // 1) preferred weather domain
+    // 2) other weather-related hits
+    // 3) unrelated hits
     let mut preferred = Vec::new();
     let mut weather_related = Vec::new();
     let mut others = Vec::new();
@@ -1798,6 +1813,7 @@ fn is_preferred_weather_domain_url(url: &str) -> bool {
 }
 
 fn is_weather_related_hit(hit: &SearchHit) -> bool {
+    // Keyword scoring is intentionally broad: weather queries prefer recall over strict precision.
     let combined = format!("{} {} {}", hit.title, hit.snippet, hit.url).to_lowercase();
     let keywords = [
         "天气",

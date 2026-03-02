@@ -1,3 +1,5 @@
+//! Image reference loading helpers for multimodal/OCR pipelines.
+
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
@@ -7,18 +9,23 @@ use tokio::fs;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_UA: &str = "Mozilla/5.0 (compatible; XzBot/1.0; +https://example.local)";
 
+/// Normalized image payload passed into model-compatible request formats.
 #[derive(Debug, Clone)]
 pub struct ImageBinary {
+    /// MIME type, e.g. `image/jpeg`.
     pub media_type: String,
+    /// Base64-encoded image data.
     pub data_base64: String,
 }
 
 impl ImageBinary {
+    /// Converts image payload to RFC2397 data URL.
     pub fn as_data_url(&self) -> String {
         format!("data:{};base64,{}", self.media_type, self.data_base64)
     }
 }
 
+/// Resolves an image reference (`http`, `base64://`, `data:`, `file://`) to binary payload.
 pub async fn load_image_for_llm(
     client: &Client,
     image_ref: &str,
@@ -41,6 +48,7 @@ pub async fn load_image_for_llm(
     bail!("unsupported image ref format: {image_ref}");
 }
 
+/// Fetches remote image with anti-hotlink headers and payload validation.
 async fn fetch_image_by_url(client: &Client, url: &str, debug: bool) -> Result<ImageBinary> {
     if debug {
         println!("[DEBUG] fetch image for llm url={url}");
@@ -132,6 +140,7 @@ async fn fetch_image_by_url(client: &Client, url: &str, debug: bool) -> Result<I
     })
 }
 
+/// Decodes `base64://...` payload into normalized image.
 fn image_from_base64_payload(payload: &str) -> Result<ImageBinary> {
     let bytes = STANDARD
         .decode(payload.trim())
@@ -144,6 +153,7 @@ fn image_from_base64_payload(payload: &str) -> Result<ImageBinary> {
     })
 }
 
+/// Decodes `data:image/...;base64,...` payload.
 fn image_from_data_url_payload(payload: &str) -> Result<ImageBinary> {
     let Some((meta, b64)) = payload.split_once(",") else {
         bail!("invalid data URL");
@@ -172,6 +182,7 @@ fn image_from_data_url_payload(payload: &str) -> Result<ImageBinary> {
     })
 }
 
+/// Loads local image file referenced by `file://`.
 async fn image_from_local_path(path: &str) -> Result<ImageBinary> {
     let path = path.trim();
     if path.is_empty() {
@@ -192,6 +203,7 @@ async fn image_from_local_path(path: &str) -> Result<ImageBinary> {
     })
 }
 
+/// Enforces common image size constraints.
 fn ensure_image_size(bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         bail!("image response is empty");
@@ -206,6 +218,7 @@ fn ensure_image_size(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Chooses final media type using header, URL hint, then magic bytes fallback.
 fn normalize_media_type(content_type: &str, url: &str, bytes: &[u8]) -> String {
     let ct = content_type.split(';').next().unwrap_or("").trim();
     if is_supported_media_type(ct) {
@@ -225,6 +238,7 @@ fn normalize_media_type(content_type: &str, url: &str, bytes: &[u8]) -> String {
     detect_media_type_from_bytes(bytes)
 }
 
+/// Detects media type from image magic bytes.
 fn detect_media_type_from_bytes(bytes: &[u8]) -> String {
     if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
         return "image/jpeg".to_string();
@@ -246,6 +260,7 @@ fn detect_media_type_from_bytes(bytes: &[u8]) -> String {
     "image/jpeg".to_string()
 }
 
+/// Returns true when MIME type is allowed for model upload.
 fn is_supported_media_type(value: &str) -> bool {
     matches!(
         value,
@@ -253,6 +268,7 @@ fn is_supported_media_type(value: &str) -> bool {
     )
 }
 
+/// Checks whether bytes start with supported image signatures.
 fn has_supported_image_magic(bytes: &[u8]) -> bool {
     if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
         return true;
@@ -274,12 +290,14 @@ fn has_supported_image_magic(bytes: &[u8]) -> bool {
     false
 }
 
+/// Returns true for text/json payload content types.
 fn is_json_or_text_content_type(content_type: &str) -> bool {
     content_type.contains("application/json")
         || content_type.contains("application/problem+json")
         || content_type.starts_with("text/")
 }
 
+/// Extracts structured remote error payload from non-image JSON body.
 fn extract_remote_image_error(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?.trim();
     if text.is_empty() {
@@ -302,6 +320,7 @@ fn extract_remote_image_error(bytes: &[u8]) -> Option<String> {
     Some(format!("retcode={} retmsg={}", retcode, retmsg))
 }
 
+/// Normalizes CQ/image reference string (quotes + HTML ampersands).
 fn normalize_image_ref(value: &str) -> String {
     value
         .trim()

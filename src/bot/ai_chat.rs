@@ -1,3 +1,5 @@
+//! AI chat plugin implementation and session orchestration.
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,6 +15,7 @@ use crate::{
     token_stats,
 };
 
+/// Chat plugin that manages session history and LLM calls.
 pub struct AiChatPlugin {
     store: Arc<MemoryStore>,
     llm: Arc<dyn Llm>,
@@ -22,6 +25,7 @@ pub struct AiChatPlugin {
 }
 
 impl AiChatPlugin {
+    /// Creates a new AI chat plugin instance.
     pub fn new(store: Arc<MemoryStore>, llm: Arc<dyn Llm>, config: Arc<Config>) -> Self {
         Self {
             store,
@@ -31,6 +35,7 @@ impl AiChatPlugin {
         }
     }
 
+    /// Handles one message event and optionally returns a reply action.
     pub async fn handle_message(&self, event: MessageEvent) -> Result<Option<ActionRequest>> {
         let raw_text = event.text();
         let trimmed = raw_text.trim();
@@ -47,6 +52,7 @@ impl AiChatPlugin {
         }
     }
 
+    /// Handles private chat flow, including `/reset` and lock gate.
     async fn handle_private_message(
         &self,
         event: MessageEvent,
@@ -80,6 +86,7 @@ impl AiChatPlugin {
         Ok(Some(ActionRequest::send_private_msg(event.user_id, reply)))
     }
 
+    /// Handles group chat flow with mention/prefix normalization.
     async fn handle_group_message(
         &self,
         event: MessageEvent,
@@ -159,6 +166,7 @@ impl AiChatPlugin {
         Ok(Some(ActionRequest::send_group_msg(group_id, message)))
     }
 
+    /// Builds prompt history, injects persona, calls LLM, and updates context.
     async fn generate_ai_reply(&self, key: SessionKey, user_input: String) -> Result<String> {
         self.store.push_user_message(key.clone(), user_input);
         let mut history = self.store.messages(&key);
@@ -218,6 +226,7 @@ impl AiChatPlugin {
         Ok(reply)
     }
 
+    /// Acquires per-session reply semaphore without waiting.
     fn try_acquire_reply_lock(&self, key: &SessionKey) -> Option<OwnedSemaphorePermit> {
         let lock_key = key.session_id();
         let semaphore = match self.reply_locks.entry(lock_key.clone()) {

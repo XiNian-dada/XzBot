@@ -1,3 +1,5 @@
+//! OCR fallback pipeline for image inputs when model vision is unavailable.
+
 use std::{
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -11,21 +13,34 @@ use tokio::{fs, process::Command, time::timeout};
 use crate::config::OcrProvider;
 use crate::llm::image::load_image_for_llm;
 
+/// OCR runtime settings assembled from `Config.ai`.
 #[derive(Debug, Clone)]
 pub struct OcrSettings {
+    /// OCR backend provider.
     pub provider: OcrProvider,
+    /// OCR command path (tesseract mode).
     pub cmd: String,
+    /// OCR language pack list.
     pub lang: String,
+    /// OCR timeout in milliseconds.
     pub timeout_ms: u64,
+    /// Paddle OCR endpoint.
     pub paddle_endpoint: String,
+    /// Paddle OCR token.
     pub paddle_token: String,
+    /// Paddle file type (`0` pdf, `1` image).
     pub paddle_file_type: u8,
+    /// Paddle optional parameter.
     pub paddle_use_doc_orientation_classify: bool,
+    /// Paddle optional parameter.
     pub paddle_use_doc_unwarping: bool,
+    /// Paddle optional parameter.
     pub paddle_use_chart_recognition: bool,
+    /// Whether to use global proxy for Paddle OCR request.
     pub paddle_use_proxy: bool,
 }
 
+/// Runs OCR for up to 3 image refs and returns merged readable text summary.
 pub async fn ocr_images_to_text(
     client: &Client,
     image_refs: &[String],
@@ -72,6 +87,7 @@ pub async fn ocr_images_to_text(
     format!("以下为图片 OCR 识别结果（可能有误）：\n{}", results.join("\n\n"))
 }
 
+/// OCR one image by downloading and invoking local tesseract.
 async fn ocr_single_image_tesseract(
     client: &Client,
     image_ref: &str,
@@ -97,6 +113,7 @@ async fn ocr_single_image_tesseract(
     output
 }
 
+/// OCR one image via Paddle OCR HTTP API.
 async fn ocr_single_image_paddle(
     client: &Client,
     image_ref: &str,
@@ -195,6 +212,7 @@ async fn ocr_single_image_paddle(
     Ok(texts.join("\n\n"))
 }
 
+/// Executes local tesseract command with timeout guard.
 async fn run_tesseract(path: &PathBuf, settings: &OcrSettings) -> Result<String> {
     let mut cmd = Command::new(&settings.cmd);
     cmd.kill_on_drop(true)
@@ -218,6 +236,7 @@ async fn run_tesseract(path: &PathBuf, settings: &OcrSettings) -> Result<String>
     Ok(text)
 }
 
+/// Builds unique temp path for OCR image materialization.
 fn temp_image_path(ext: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     let nanos = SystemTime::now()
@@ -229,6 +248,7 @@ fn temp_image_path(ext: &str) -> PathBuf {
     path
 }
 
+/// Maps media type to reasonable file extension for OCR temp files.
 fn extension_from_media_type(media_type: &str) -> &'static str {
     let lower = media_type.to_ascii_lowercase();
     if lower.contains("png") {

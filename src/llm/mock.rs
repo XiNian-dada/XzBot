@@ -1,3 +1,5 @@
+//! Mock LLM provider used for local end-to-end testing without real AI API.
+
 use async_trait::async_trait;
 
 use anyhow::{Context, Result};
@@ -12,6 +14,7 @@ use crate::{
     },
 };
 
+/// Mock provider implementation that echoes input and optionally runs tools.
 pub struct MockLlm {
     client: reqwest::Client,
     debug: bool,
@@ -20,6 +23,7 @@ pub struct MockLlm {
 }
 
 impl MockLlm {
+    /// Constructs mock provider with shared HTTP client.
     pub fn new(
         debug: bool,
         timeout_ms: u64,
@@ -39,6 +43,7 @@ impl MockLlm {
 
 #[async_trait]
 impl Llm for MockLlm {
+    /// Generates deterministic mock reply from latest user message.
     async fn chat(
         &self,
         _session_id: String,
@@ -95,6 +100,7 @@ impl Llm for MockLlm {
     }
 }
 
+/// Lightweight heuristic for deciding whether mock mode should call search tool.
 fn should_search(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("最新")
@@ -105,6 +111,7 @@ fn should_search(text: &str) -> bool {
         || lower.contains("search")
 }
 
+/// Detects system-info scope keywords from plain text.
 fn detect_system_scope(text: &str) -> Option<&'static str> {
     let lower = text.to_lowercase();
     if lower.contains("cpu") {

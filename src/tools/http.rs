@@ -1,3 +1,5 @@
+//! Shared HTTP client builder with timeout/cookie/proxy options.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -5,6 +7,7 @@ use reqwest::{Client, Proxy};
 
 use crate::config::NetworkConfig;
 
+/// Builds a reqwest client honoring global proxy settings.
 pub fn build_client(timeout_ms: u64, network: &NetworkConfig, cookies: bool) -> Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_millis(timeout_ms));
     if cookies {
