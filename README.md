@@ -12,9 +12,10 @@
 - **OCR 兜底** — 非多模态模型自动 OCR（Tesseract / PaddleOCR）
 - **Function Call 工具**
   - `search_web` — 网页搜索
-  - `fetch_url` — 抓取 URL 内容
+  - `fetch_url` — 抓取 URL 内容（浏览器风格请求 + 失败时 reader 兜底）
   - `get_system_info` — 只读系统信息
-  - `get_weather` — 天气查询
+  - `get_process_info` — 只读 XzBot 进程资源占用
+  - `get_weather` — 天气查询（当前天气，作为兜底）
 - **权限控制** — 支持 None / OwnerOnly / Whitelist 三种模式
 - **运行时指令** — `/reset`、`/blacklist`（仅 owner）
 
@@ -50,6 +51,7 @@ ws://<主机IP>:3000/onebot/v11/ws
 
 - 内置 Bing（中国版）
 - 自建 SearXNG（启用后不再使用内置搜索）
+- 天气查询场景下，SearXNG 结果会优先 `tianqi.2345.com`，并自动附带天气页预览
 
 对应配置项：
 
@@ -87,6 +89,14 @@ paddle_use_proxy = true
 
 所有 HTTP 请求默认走同一代理（LLM / 搜索 / OCR / fetch_url 等）。
 如需 **仅让 Paddle OCR 直连**，可设置 `paddle_use_proxy=false`。
+
+### URL 抓取策略
+
+`fetch_url` 采用两段式：
+1. 浏览器风格请求（完整请求头）
+2. 若失败/命中 JS 门页/反爬页，自动回退 `reader proxy` 抓取正文
+
+这样在动态站点和反爬站点上稳定性更高。
 
 ```toml
 [network]

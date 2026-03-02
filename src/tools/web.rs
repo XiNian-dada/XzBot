@@ -391,6 +391,7 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
         println!("[DEBUG] tool.fetch_url url={url}");
     }
 
+    // First pass: fetch with browser-like headers to reduce anti-bot/error stubs.
     let response = match fetch_with_browser_profile(client, &url).await {
         Ok(resp) => resp,
         Err(err) => {
@@ -398,6 +399,7 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
                 println!("[DEBUG] fetch primary failed url={} err={}", url, err);
                 println!("[DEBUG] fetch fallback to reader proxy url={url}");
             }
+            // Fallback: use reader proxy to get rendered-readable text when direct fetch fails.
             if let Ok(v) = fetch_via_reader_proxy(client, &url, debug).await {
                 return Ok(v);
             }
@@ -441,6 +443,7 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
             title
         };
 
+        // Detect JS-gated/anti-bot pages and fallback to reader proxy automatically.
         if should_fallback_to_reader(&body, &text) {
             if debug {
                 println!("[DEBUG] fetch primary looks blocked/js-gated url={url} final={final_url}");
@@ -763,7 +766,15 @@ async fn search_web_searxng(
         return Ok(out);
     }
 
-    // SearXNG：不做清洗，保持原始顺序，仅去重。
+    let weather_query = is_weather_query(q);
+    // Weather intent: prefer weather domains before generic ranking.
+    let hits = if weather_query {
+        reorder_weather_hits(hits)
+    } else {
+        hits
+    };
+
+    // SearXNG：常规保序去重；天气查询会先做 weather 域名重排。
     let top_hits = take_unique_hits_preserve_order(hits, 5);
     let mut out = format!("Web 搜索结果（provider: searxng, query: {q}）:\n");
     for (idx, hit) in top_hits.iter().enumerate() {
@@ -784,6 +795,31 @@ async fn search_web_searxng(
                 hit.url,
                 hit.snippet
             ));
+        }
+    }
+
+    if weather_query {
+        // For weather queries, prefetch one high-priority page preview so the model
+        // gets concrete multi-day forecast content without extra tool roundtrips.
+        let preview_target = top_hits
+            .iter()
+            .find(|hit| is_preferred_weather_domain_url(&hit.url))
+            .or_else(|| top_hits.first());
+        if let Some(target) = preview_target {
+            match fetch_search_preview(client, &target.url).await {
+                Ok(preview) => {
+                    out.push_str("\n天气网页核验预览（自动抓取，优先天气站）:\n");
+                    out.push_str(&format!("1. {} - {}\n{}\n", target.title, target.url, preview));
+                }
+                Err(err) => {
+                    if debug {
+                        println!(
+                            "[DEBUG] weather preview fetch failed url={} err={}",
+                            target.url, err
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1720,6 +1756,62 @@ fn take_unique_hits_preserve_order(hits: Vec<SearchHit>, limit: usize) -> Vec<Se
         }
     }
     out
+}
+
+fn is_weather_query(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    lower.contains("天气")
+        || lower.contains("气温")
+        || lower.contains("温度")
+        || lower.contains("下雨")
+        || lower.contains("weather")
+        || lower.contains("forecast")
+}
+
+fn reorder_weather_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    let mut preferred = Vec::new();
+    let mut weather_related = Vec::new();
+    let mut others = Vec::new();
+
+    for hit in hits {
+        if is_preferred_weather_domain_url(&hit.url) {
+            preferred.push(hit);
+            continue;
+        }
+        if is_weather_related_hit(&hit) {
+            weather_related.push(hit);
+        } else {
+            others.push(hit);
+        }
+    }
+
+    preferred.extend(weather_related);
+    preferred.extend(others);
+    preferred
+}
+
+fn is_preferred_weather_domain_url(url: &str) -> bool {
+    let Some(host) = host_of(url) else {
+        return false;
+    };
+    host == "tianqi.2345.com" || host.ends_with(".tianqi.2345.com")
+}
+
+fn is_weather_related_hit(hit: &SearchHit) -> bool {
+    let combined = format!("{} {} {}", hit.title, hit.snippet, hit.url).to_lowercase();
+    let keywords = [
+        "天气",
+        "预报",
+        "一周",
+        "7天",
+        "15天",
+        "30天",
+        "气温",
+        "weather",
+        "forecast",
+        "tianqi",
+    ];
+    keywords.iter().any(|kw| combined.contains(kw))
 }
 
 fn build_query_variants(query: &str) -> Vec<String> {
