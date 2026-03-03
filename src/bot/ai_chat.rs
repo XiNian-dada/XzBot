@@ -9,7 +9,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::{
     config::Config,
     llm::Llm,
-    logger::debug as log_debug,
+    logger::{debug as log_debug, info as log_info},
     onebot::{action::ActionRequest, event::MessageEvent},
     store::memory::{MemoryStore, SessionKey},
     token_stats,
@@ -214,7 +214,7 @@ impl AiChatPlugin {
             self.config.debug,
             format!("llm reply length={}", reply.len()),
         );
-        println!(
+        log_info(format!(
             "[TOKEN] this_call: prompt={} completion={} total={} | cumulative: prompt={} completion={} total={}",
             token_delta.prompt,
             token_delta.completion,
@@ -222,7 +222,7 @@ impl AiChatPlugin {
             token_after.prompt,
             token_after.completion,
             token_after.total
-        );
+        ));
         Ok(reply)
     }
 

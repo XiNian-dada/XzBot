@@ -1,23 +1,64 @@
 //! Minimal logging helpers with leveled prefixes.
 
+use std::{
+    collections::VecDeque,
+    sync::{Mutex, OnceLock},
+};
+
+const MAX_RECENT_LOG_LINES: usize = 5000;
+static RECENT_LOGS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+fn push_recent(line: String) {
+    let logs = RECENT_LOGS.get_or_init(|| Mutex::new(VecDeque::new()));
+    if let Ok(mut guard) = logs.lock() {
+        guard.push_back(line);
+        while guard.len() > MAX_RECENT_LOG_LINES {
+            let _ = guard.pop_front();
+        }
+    }
+}
+
 /// Logs an info-level message.
 pub fn info(msg: impl AsRef<str>) {
-    println!("[INFO] {}", msg.as_ref());
+    let line = format!("[INFO] {}", msg.as_ref());
+    println!("{line}");
+    push_recent(line);
 }
 
 /// Logs a warning-level message.
 pub fn warn(msg: impl AsRef<str>) {
-    eprintln!("[WARN] {}", msg.as_ref());
+    let line = format!("[WARN] {}", msg.as_ref());
+    eprintln!("{line}");
+    push_recent(line);
 }
 
 /// Logs an error-level message.
 pub fn error(msg: impl AsRef<str>) {
-    eprintln!("[ERROR] {}", msg.as_ref());
+    let line = format!("[ERROR] {}", msg.as_ref());
+    eprintln!("{line}");
+    push_recent(line);
 }
 
 /// Logs a debug-level message when `enabled` is true.
 pub fn debug(enabled: bool, msg: impl AsRef<str>) {
     if enabled {
-        println!("[DEBUG] {}", msg.as_ref());
+        let line = format!("[DEBUG] {}", msg.as_ref());
+        println!("{line}");
+        push_recent(line);
     }
+}
+
+/// Returns at most the most recent `limit` lines kept in in-memory log buffer.
+pub fn recent_lines(limit: usize) -> Vec<String> {
+    let logs = RECENT_LOGS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let Ok(guard) = logs.lock() else {
+        return Vec::new();
+    };
+
+    let take = limit.min(guard.len());
+    guard
+        .iter()
+        .skip(guard.len().saturating_sub(take))
+        .cloned()
+        .collect()
 }

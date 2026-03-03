@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context};
@@ -24,7 +24,7 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use tokio::{fs, net::TcpListener};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::timeout;
 
@@ -400,6 +400,13 @@ async fn process_incoming(
             .collect();
     }
 
+    if let Some(actions) = try_dump_log_command(state, &event, &config).await {
+        return actions
+            .into_iter()
+            .filter_map(|v| serde_json::to_string(&v).ok())
+            .collect();
+    }
+
     let actions = match router.route_message(event).await {
         Ok(action) => action,
         Err(err) => {
@@ -504,6 +511,109 @@ fn reload_reply_action(event: &MessageEvent, message: String) -> ActionRequest {
         }
     }
     ActionRequest::send_private_msg(event.user_id, message)
+}
+
+/// Handles owner `/log [N]` command and returns an upload action for recent logs.
+async fn try_dump_log_command(
+    state: &AppState,
+    event: &MessageEvent,
+    config: &Config,
+) -> Option<Vec<ActionRequest>> {
+    let line_limit = parse_log_command(event, config.owner.qq)?;
+    let lines = crate::logger::recent_lines(line_limit);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let base_dir = state
+        .config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir());
+    let log_dir = base_dir.join("logs");
+    if let Err(err) = fs::create_dir_all(&log_dir).await {
+        return Some(vec![reload_reply_action(
+            event,
+            format!("导出日志失败：无法创建目录 {} ({err})", log_dir.display()),
+        )]);
+    }
+
+    let file_name = format!("xzbot-log-{}-{}.txt", ts, lines.len());
+    let file_path = log_dir.join(&file_name);
+    let mut body = format!(
+        "# XzBot Recent Logs\n# generated_at_unix={ts}\n# requested_lines={line_limit}\n# exported_lines={}\n\n",
+        lines.len()
+    );
+    if lines.is_empty() {
+        body.push_str("(no buffered logs)\n");
+    } else {
+        for line in lines {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+
+    if let Err(err) = fs::write(&file_path, body).await {
+        return Some(vec![reload_reply_action(
+            event,
+            format!("导出日志失败：无法写入文件 {} ({err})", file_path.display()),
+        )]);
+    }
+
+    let action = if event.message_type == "group" {
+        if let Some(group_id) = event.group_id {
+            ActionRequest::upload_group_file(
+                group_id,
+                file_path.to_string_lossy().to_string(),
+                Some(file_name),
+            )
+        } else {
+            ActionRequest::upload_private_file(
+                event.user_id,
+                file_path.to_string_lossy().to_string(),
+                Some(file_name),
+            )
+        }
+    } else {
+        ActionRequest::upload_private_file(
+            event.user_id,
+            file_path.to_string_lossy().to_string(),
+            Some(file_name),
+        )
+    };
+
+    Some(vec![action])
+}
+
+/// Parses owner `/log [N]` command and returns requested line count.
+fn parse_log_command(event: &MessageEvent, owner_qq: i64) -> Option<usize> {
+    if event.user_id != owner_qq {
+        return None;
+    }
+
+    let text = event.text();
+    let normalized = if event.message_type == "private" {
+        text.trim().to_string()
+    } else if event.message_type == "group" {
+        let at_me = format!("[CQ:at,qq={}]", event.self_id);
+        if !text.contains(&at_me) {
+            return None;
+        }
+        text.replace(&at_me, "").trim().to_string()
+    } else {
+        return None;
+    };
+
+    let mut parts = normalized.split_whitespace();
+    if parts.next()? != "/log" {
+        return None;
+    }
+    let requested = parts
+        .next()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(100);
+    Some(requested.clamp(10, 2000))
 }
 
 /// Reloads config and plugin runtime without process restart.
