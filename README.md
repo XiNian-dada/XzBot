@@ -17,7 +17,8 @@
   - `get_process_info` — 只读 XzBot 进程资源占用
   - `get_weather` — 天气查询（当前天气，作为兜底）
 - **权限控制** — 支持 None / OwnerOnly / Whitelist 三种模式
-- **运行时指令** — `/reset`、`/blacklist`（仅 owner）
+- **运行时指令** — `/reset`、`/blacklist`、`/reload`、`/log`、`/posttoken`
+- **外部推送 API** — 通过聊天绑定 token 向指定会话发送文本/图片/文件
 
 ## 快速开始
 
@@ -114,6 +115,43 @@ proxy_timeout_ms = 5000
 | `/blacklist list` | 查看群黑名单 |
 | `/blacklist add <group_id>` | 添加群到黑名单 |
 | `/blacklist remove <group_id>` | 从黑名单移除群 |
+| `/reload`（owner） | 重载配置与插件 |
+| `/log [N]`（owner） | 导出最近 N 行日志并发送文件（默认 100） |
+| `/posttoken create/show/regen/delete`（owner） | 管理当前会话的外部推送 token |
+
+## 外部推送 API
+
+先由 owner 在目标会话创建 token：
+
+- 私聊：`/posttoken create`
+- 群聊：`@机器人 /posttoken create`（token 会私聊发给 owner）
+
+然后调用 HTTP 接口（默认监听同服务端口）：
+
+- `POST /api/post/send`
+- `Content-Type: application/json`
+
+请求体示例：
+
+```json
+{
+  "token": "YOUR_CHAT_TOKEN",
+  "message": "你好，这是外部推送",
+  "image": "https://example.com/a.jpg",
+  "file_path": "/abs/path/report.md",
+  "file_name": "report.md"
+}
+```
+
+字段说明：
+
+- `token`：必填，聊天绑定 token
+- `message`：可选，文本消息
+- `image` / `images`：可选，图片引用（字符串或字符串数组）
+- `file_path`：可选，上传文件路径
+- `file_name`：可选，上传显示名
+
+至少需要提供 `message`、`image/images`、`file_path` 中的一项。
 
 ## 插件（托管进程）
 

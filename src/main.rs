@@ -14,11 +14,11 @@ use anyhow::{anyhow, Context};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Json, Query, State,
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use dashmap::DashMap;
@@ -38,6 +38,7 @@ use crate::{
     logger::{debug as log_debug, error as log_error, info as log_info, warn as log_warn},
     onebot::action::ActionRequest,
     onebot::event::{extract_cq_image_refs, MessageEvent, MessagePayload},
+    post_api::{chat_target_desc, ChatTokenStore},
     plugins::PluginManager,
     store::memory::MemoryStore,
     tools::http::build_client,
@@ -48,6 +49,7 @@ mod config;
 mod llm;
 mod logger;
 mod onebot;
+mod post_api;
 mod plugins;
 mod store;
 mod token_stats;
@@ -59,6 +61,8 @@ struct AppState {
     runtime: Arc<RwLock<RuntimeState>>,
     config_path: Arc<PathBuf>,
     store: Arc<MemoryStore>,
+    post_tokens: Arc<ChatTokenStore>,
+    ws_action_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
 }
 
 /// Live runtime object that can be atomically swapped on `/reload`.
@@ -148,6 +152,9 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::load(&config_path)?);
     check_proxy_availability(&config.network).await?;
     let store = Arc::new(MemoryStore::new());
+    let token_store_path = exe_dir.join("config").join("post_tokens.json");
+    let post_tokens = Arc::new(ChatTokenStore::load(token_store_path).await?);
+    let ws_action_tx = Arc::new(RwLock::new(None));
     let plugin_root = std::env::current_dir()?.join("Plugins");
     let plugins = PluginManager::load_from_dir(&plugin_root, config.clone())?;
     log_info(format!("Plugins dir: {}", plugin_root.display()));
@@ -164,10 +171,13 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route(ws_path.as_str(), get(onebot_ws_handler))
+        .route("/api/post/send", post(post_send_handler))
         .with_state(AppState {
             runtime,
             config_path: Arc::new(config_path.clone()),
             store,
+            post_tokens,
+            ws_action_tx,
         });
 
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -262,11 +272,177 @@ async fn onebot_ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum OneOrManyString {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrManyString {
+    /// Normalizes single-or-list payload into flat string list.
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(v) => vec![v],
+            Self::Many(v) => v,
+        }
+    }
+}
+
+/// HTTP payload for external POST push API.
+#[derive(Debug, serde::Deserialize)]
+struct PostSendRequest {
+    token: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    image: Option<OneOrManyString>,
+    #[serde(default)]
+    images: Option<OneOrManyString>,
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+/// JSON response for external POST push API.
+#[derive(Debug, serde::Serialize)]
+struct PostSendResponse {
+    ok: bool,
+    sent_actions: usize,
+    chat_type: String,
+    user_id: i64,
+    group_id: Option<i64>,
+}
+
+/// POST endpoint: send message/image/file to chat bound by token.
+async fn post_send_handler(
+    State(state): State<AppState>,
+    Json(req): Json<PostSendRequest>,
+) -> impl IntoResponse {
+    let token = req.token.trim().to_string();
+    if token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "token is empty" })),
+        )
+            .into_response();
+    }
+
+    let Some(target) = state.post_tokens.lookup_token(&token).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "invalid token" })),
+        )
+            .into_response();
+    };
+
+    let sender = {
+        let guard = state.ws_action_tx.read().await;
+        guard.clone()
+    };
+    let Some(sender) = sender else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": "onebot websocket not connected" })),
+        )
+            .into_response();
+    };
+
+    let mut actions = Vec::new();
+    if let Some(file_path) = req.file_path.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        let action = if target.chat_type == "group" {
+            ActionRequest::upload_group_file(
+                target.group_id.unwrap_or_default(),
+                file_path.to_string(),
+                req.file_name.clone(),
+            )
+        } else {
+            ActionRequest::upload_private_file(target.user_id, file_path.to_string(), req.file_name.clone())
+        };
+        actions.push(action);
+    }
+
+    let mut images = Vec::new();
+    if let Some(v) = req.image {
+        images.extend(v.into_vec());
+    }
+    if let Some(v) = req.images {
+        images.extend(v.into_vec());
+    }
+    images = images
+        .into_iter()
+        .map(|v| normalize_image_ref(&v))
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    let mut text = req.message.unwrap_or_default();
+    for image_ref in images {
+        if !text.is_empty() && !text.ends_with(' ') {
+            text.push(' ');
+        }
+        text.push_str(&format!("[CQ:image,file={}]", image_ref));
+    }
+    if !text.trim().is_empty() {
+        let action = if target.chat_type == "group" {
+            ActionRequest::send_group_msg(target.group_id.unwrap_or_default(), text)
+        } else {
+            ActionRequest::send_private_msg(target.user_id, text)
+        };
+        actions.push(action);
+    }
+
+    if actions.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "no message/image/file provided" })),
+        )
+            .into_response();
+    }
+
+    for action in &actions {
+        let encoded = match serde_json::to_string(action) {
+            Ok(v) => v,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "error": format!("encode action failed: {err}") })),
+                )
+                    .into_response();
+            }
+        };
+        if sender.send(encoded).is_err() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "ok": false, "error": "failed to send action to websocket" })),
+            )
+                .into_response();
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(PostSendResponse {
+            ok: true,
+            sent_actions: actions.len(),
+            chat_type: target.chat_type,
+            user_id: target.user_id,
+            group_id: target.group_id,
+        })
+        .unwrap_or_else(|_| json!({ "ok": true, "sent_actions": actions.len() }))),
+    )
+        .into_response()
+}
+
 /// One websocket connection lifecycle (reader loop + writer task).
 async fn handle_socket(socket: WebSocket, state: AppState) {
     log_info("websocket connected");
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    {
+        let mut guard = state.ws_action_tx.write().await;
+        *guard = Some(tx.clone());
+    }
     let debug = {
         let runtime = state.runtime.read().await;
         runtime.config.debug
@@ -325,6 +501,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     drop(tx);
     let _ = writer.await;
+    {
+        let mut guard = state.ws_action_tx.write().await;
+        if let Some(current) = guard.as_ref() {
+            if current.same_channel(&bridge.action_tx) {
+                *guard = None;
+            }
+        }
+    }
     log_info("websocket disconnected");
 }
 
@@ -397,6 +581,13 @@ async fn process_incoming(
         return serde_json::to_string(&action)
             .ok()
             .into_iter()
+            .collect();
+    }
+
+    if let Some(actions) = try_post_token_command(state, &event, &config).await {
+        return actions
+            .into_iter()
+            .filter_map(|v| serde_json::to_string(&v).ok())
             .collect();
     }
 
@@ -614,6 +805,160 @@ fn parse_log_command(event: &MessageEvent, owner_qq: i64) -> Option<usize> {
         .and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(100);
     Some(requested.clamp(10, 2000))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PostTokenCommand {
+    Create,
+    Show,
+    Regenerate,
+    Delete,
+}
+
+/// Handles owner `/posttoken` commands for chat-bound external push token management.
+async fn try_post_token_command(
+    state: &AppState,
+    event: &MessageEvent,
+    config: &Config,
+) -> Option<Vec<ActionRequest>> {
+    let command = parse_post_token_command(event, config.owner.qq)?;
+    let (chat_type, user_id, group_id) = if event.message_type == "group" {
+        ("group", event.user_id, event.group_id)
+    } else if event.message_type == "private" {
+        ("private", event.user_id, None)
+    } else {
+        return Some(vec![reload_reply_action(
+            event,
+            "仅支持私聊或群聊中使用 /posttoken。".to_string(),
+        )]);
+    };
+
+    let Some(group_id_checked) = (if chat_type == "group" {
+        group_id
+    } else {
+        Some(0)
+    }) else {
+        return Some(vec![reload_reply_action(
+            event,
+            "当前群聊缺少 group_id，无法创建 token。".to_string(),
+        )]);
+    };
+
+    let result = match command {
+        PostTokenCommand::Create => state
+            .post_tokens
+            .get_or_create(chat_type, user_id, group_id)
+            .await
+            .map(|(entry, created)| {
+                let status = if created { "已创建" } else { "已存在" };
+                format!(
+                    "{} POST token。\n目标会话：{}\nToken: {}",
+                    status,
+                    chat_target_desc(&entry),
+                    entry.token
+                )
+            }),
+        PostTokenCommand::Show => state
+            .post_tokens
+            .get_or_create(chat_type, user_id, group_id)
+            .await
+            .map(|(entry, _)| {
+                format!(
+                    "当前 POST token。\n目标会话：{}\nToken: {}",
+                    chat_target_desc(&entry),
+                    entry.token
+                )
+            }),
+        PostTokenCommand::Regenerate => state
+            .post_tokens
+            .regenerate(chat_type, user_id, group_id)
+            .await
+            .map(|entry| {
+                format!(
+                    "已重新生成 POST token。\n目标会话：{}\nToken: {}",
+                    chat_target_desc(&entry),
+                    entry.token
+                )
+            }),
+        PostTokenCommand::Delete => state
+            .post_tokens
+            .remove(chat_type, user_id, group_id)
+            .await
+            .map(|removed| {
+                if chat_type == "group" {
+                    format!(
+                        "目标会话：group:{}\n{}",
+                        group_id_checked,
+                        if removed { "Token 已删除。" } else { "未找到 token。" }
+                    )
+                } else {
+                    format!(
+                        "目标会话：private:{}\n{}",
+                        user_id,
+                        if removed { "Token 已删除。" } else { "未找到 token。" }
+                    )
+                }
+            }),
+    };
+
+    let text = match result {
+        Ok(v) => v,
+        Err(err) => return Some(vec![reload_reply_action(event, format!("操作失败：{err}"))]),
+    };
+
+    if matches!(command, PostTokenCommand::Delete) {
+        return Some(vec![reload_reply_action(event, text)]);
+    }
+
+    if event.message_type == "group" {
+        let mut out = Vec::new();
+        out.push(ActionRequest::send_private_msg(event.user_id, text));
+        if let Some(group_id) = event.group_id {
+            out.push(ActionRequest::send_group_msg(
+                group_id,
+                format!(
+                    "[CQ:at,qq={}] token 已发送到你的私聊，请注意保密。",
+                    event.user_id
+                ),
+            ));
+        }
+        Some(out)
+    } else {
+        Some(vec![ActionRequest::send_private_msg(event.user_id, text)])
+    }
+}
+
+/// Parses `/posttoken` command and enforces owner/auth mention rules.
+fn parse_post_token_command(event: &MessageEvent, owner_qq: i64) -> Option<PostTokenCommand> {
+    if event.user_id != owner_qq {
+        return None;
+    }
+
+    let text = event.text();
+    let normalized = if event.message_type == "private" {
+        text.trim().to_string()
+    } else if event.message_type == "group" {
+        let at_me = format!("[CQ:at,qq={}]", event.self_id);
+        if !text.contains(&at_me) {
+            return None;
+        }
+        text.replace(&at_me, "").trim().to_string()
+    } else {
+        return None;
+    };
+
+    let mut parts = normalized.split_whitespace();
+    if parts.next()? != "/posttoken" {
+        return None;
+    }
+
+    match parts.next().unwrap_or("show").to_ascii_lowercase().as_str() {
+        "create" => Some(PostTokenCommand::Create),
+        "show" => Some(PostTokenCommand::Show),
+        "regen" | "regenerate" | "reset" => Some(PostTokenCommand::Regenerate),
+        "delete" | "remove" | "del" => Some(PostTokenCommand::Delete),
+        _ => Some(PostTokenCommand::Show),
+    }
 }
 
 /// Reloads config and plugin runtime without process restart.
