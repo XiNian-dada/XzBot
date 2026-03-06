@@ -19,3 +19,6 @@ config.local.toml
 
 # Runtime-generated config next to binary
 **/config/config.toml
+*.jpg
+*.jpeg
+*.png
