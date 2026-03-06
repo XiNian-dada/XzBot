@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::{
-    config::{AiConfig, NetworkConfig, SearchConfig, VisionMode},
+    config::{AiConfig, NetworkConfig, OpenAiWireApi, SearchConfig, VisionMode},
     llm::Llm,
     llm::{
         image::load_image_for_llm,
@@ -28,8 +28,11 @@ pub struct OpenAiCompatibleLlm {
     client: reqwest::Client,
     endpoint: String,
     base_url: String,
+    wire_api: OpenAiWireApi,
     api_key: String,
     model: String,
+    reasoning_effort: String,
+    disable_response_storage: bool,
     temperature: f32,
     max_tokens: u32,
     timeout_ms: u64,
@@ -106,11 +109,7 @@ impl OpenAiCompatibleLlm {
         debug: bool,
     ) -> Result<Self> {
         let base = config.base_url.trim_end_matches('/').to_string();
-        let endpoint = if base.ends_with("/chat/completions") {
-            base
-        } else {
-            format!("{base}/chat/completions")
-        };
+        let endpoint = resolve_openai_endpoint(&base, config.wire_api);
         let client = build_client(config.timeout_ms, network, false)
             .context("failed to build HTTP client for OpenAI-compatible provider")?;
 
@@ -118,8 +117,11 @@ impl OpenAiCompatibleLlm {
             client,
             endpoint,
             base_url: config.base_url.clone(),
+            wire_api: config.wire_api,
             api_key: config.api_key.clone(),
             model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort.clone(),
+            disable_response_storage: config.disable_response_storage,
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             timeout_ms: config.timeout_ms,
@@ -158,25 +160,56 @@ impl Llm for OpenAiCompatibleLlm {
         self.preload_current_turn_url_context(&messages, &mut request_messages)
             .await?;
 
-        let with_tools = self
-            .chat_with_function_calls(session_id.clone(), request_messages.clone())
-            .await;
+        let reply = match self.wire_api {
+            OpenAiWireApi::ChatCompletions => {
+                let with_tools = self
+                    .chat_with_function_calls(session_id.clone(), request_messages.clone())
+                    .await;
 
-        let reply = match with_tools {
-            Ok(v) => v,
-            Err(err) => {
-                if self.debug {
-                    println!("[DEBUG] openai tool mode failed, fallback plain chat: {err}");
-                }
-                match self.chat_plain(session_id, request_messages).await {
+                match with_tools {
                     Ok(v) => v,
-                    Err(plain_err) => {
+                    Err(err) => {
+                        if self.debug {
+                            println!("[DEBUG] openai tool mode failed, fallback plain chat: {err}");
+                        }
+                        match self.chat_plain(session_id, request_messages).await {
+                            Ok(v) => v,
+                            Err(plain_err) => {
+                                if self.debug {
+                                    println!(
+                                        "[DEBUG] openai plain fallback failed, return transient message: {plain_err:#}"
+                                    );
+                                }
+                                temporary_network_reply()
+                            }
+                        }
+                    }
+                }
+            }
+            OpenAiWireApi::Responses => {
+                let with_tools = self
+                    .chat_with_function_calls_responses(session_id.clone(), request_messages.clone())
+                    .await;
+
+                match with_tools {
+                    Ok(v) => v,
+                    Err(err) => {
                         if self.debug {
                             println!(
-                                "[DEBUG] openai plain fallback failed, return transient message: {plain_err:#}"
+                                "[DEBUG] openai responses tool mode failed, fallback plain chat: {err}"
                             );
                         }
-                        temporary_network_reply()
+                        match self.chat_plain_responses(session_id, request_messages).await {
+                            Ok(v) => v,
+                            Err(plain_err) => {
+                                if self.debug {
+                                    println!(
+                                        "[DEBUG] openai responses plain fallback failed, return transient message: {plain_err:#}"
+                                    );
+                                }
+                                temporary_network_reply()
+                            }
+                        }
                     }
                 }
             }
@@ -370,6 +403,153 @@ impl OpenAiCompatibleLlm {
             .await
     }
 
+    async fn chat_with_function_calls_responses(
+        &self,
+        session_id: String,
+        request_messages: Vec<Value>,
+    ) -> Result<String> {
+        const MAX_TOOL_ROUNDS: usize = 3;
+        let mut ctx = self.build_responses_context(request_messages);
+        let tools = openai_responses_tools_schema();
+        let mut executed_tool_signatures = HashSet::new();
+
+        for round in 0..=MAX_TOOL_ROUNDS {
+            let stage = if has_responses_tool_results(&ctx.input) {
+                "final_answer"
+            } else {
+                "tool_planning"
+            };
+            let temperature = if stage == "tool_planning" {
+                self.tool_planning_temperature()
+            } else {
+                self.answer_temperature()
+            };
+
+            if self.debug {
+                println!(
+                    "[DEBUG] calling OpenAI-compatible responses endpoint={} model={} session={} input={} round={} stage={} temperature={:.2}",
+                    self.endpoint,
+                    self.model,
+                    session_id,
+                    ctx.input.len(),
+                    round,
+                    stage,
+                    temperature
+                );
+            }
+
+            let payload = self.build_responses_payload(
+                &session_id,
+                &ctx.instructions,
+                &ctx.input,
+                temperature,
+                Some(&tools),
+            );
+            let value = self.call_openai(payload).await?;
+            let parsed = parse_responses_output(&value)?;
+
+            if parsed.tool_calls.is_empty() {
+                if let Some(call) =
+                    recover_tool_call_from_text(&parsed.content, &ctx.input, round, self.debug)
+                {
+                    if self.debug {
+                        println!(
+                            "[DEBUG] recovered textual responses tool call name={} args={}",
+                            call.name, call.arguments
+                        );
+                    }
+                    ctx.input.push(build_responses_function_call_item(&call));
+                    let result = self.execute_tool_call(&call).await;
+                    ctx.input.push(build_responses_function_call_output_item(
+                        &call.id, &result,
+                    ));
+                    continue;
+                }
+
+                let reply = parsed.content.trim().to_string();
+                if reply.is_empty() {
+                    if self.debug {
+                        let raw = truncate_debug_json(&parsed.assistant_output);
+                        println!("[DEBUG] responses tool mode got empty assistant content: {raw}");
+                    }
+                    return self
+                        .force_final_answer_without_tools_responses(
+                            session_id,
+                            ctx,
+                            "tool mode empty content",
+                        )
+                        .await;
+                }
+
+                return Ok(append_finish_reason_hint(reply, parsed.finish_reason));
+            }
+
+            if self.debug {
+                println!(
+                    "[DEBUG] openai responses tool calls requested: {}",
+                    parsed.tool_calls.len()
+                );
+            }
+
+            if round >= MAX_TOOL_ROUNDS {
+                if self.debug {
+                    println!("[DEBUG] responses tool call rounds exceeded, forcing final answer");
+                }
+                return self
+                    .force_final_answer_without_tools_responses(
+                        session_id,
+                        ctx,
+                        "tool call rounds exceeded",
+                    )
+                    .await;
+            }
+
+            let mut executed_in_this_round = 0usize;
+            let mut skipped_duplicate = 0usize;
+            for call in parsed.tool_calls {
+                let signature = tool_call_signature(&call);
+                if !signature.is_empty() && executed_tool_signatures.contains(&signature) {
+                    skipped_duplicate += 1;
+                    if self.debug {
+                        println!(
+                            "[DEBUG] skip duplicate responses tool call name={} id={} signature={}",
+                            call.name, call.id, signature
+                        );
+                    }
+                    continue;
+                }
+
+                ctx.input.push(build_responses_function_call_item(&call));
+                if !signature.is_empty() {
+                    executed_tool_signatures.insert(signature);
+                }
+                let result = self.execute_tool_call(&call).await;
+                executed_in_this_round += 1;
+                ctx.input.push(build_responses_function_call_output_item(
+                    &call.id, &result,
+                ));
+            }
+
+            if executed_in_this_round == 0 && skipped_duplicate > 0 {
+                if self.debug {
+                    println!(
+                        "[DEBUG] all requested responses tools are duplicates, force final answer to save tokens"
+                    );
+                }
+                return self
+                    .force_final_answer_without_tools_responses(
+                        session_id,
+                        ctx,
+                        "duplicate tool calls only",
+                    )
+                    .await;
+            }
+        }
+
+        self.force_final_answer_without_tools_responses(session_id, ctx, "tool loop end")
+            .await
+    }
+
     async fn chat_plain(&self, session_id: String, messages: Vec<Value>) -> Result<String> {
         let mut messages = messages;
         normalize_system_messages(&mut messages);
@@ -420,6 +600,50 @@ impl OpenAiCompatibleLlm {
             .await?;
         let finish = if continued { None } else { finish_reason };
         Ok(append_finish_reason_hint(reply, finish))
+    }
+
+    async fn chat_plain_responses(
+        &self,
+        session_id: String,
+        request_messages: Vec<Value>,
+    ) -> Result<String> {
+        let ctx = self.build_responses_context(request_messages);
+        let temperature = self.answer_temperature();
+        if self.debug {
+            println!(
+                "[DEBUG] calling OpenAI-compatible responses plain endpoint={} model={} session={} input={} temperature={:.2}",
+                self.endpoint,
+                self.model,
+                session_id,
+                ctx.input.len(),
+                temperature
+            );
+        }
+
+        let payload =
+            self.build_responses_payload(&session_id, &ctx.instructions, &ctx.input, temperature, None);
+        let value = self.call_openai(payload).await?;
+        let parsed = parse_responses_output(&value)?;
+        let reply = parsed.content.trim().to_string();
+
+        if reply.is_empty() {
+            if self.debug {
+                let raw = truncate_debug_json(&parsed.assistant_output);
+                println!("[DEBUG] responses plain chat got empty assistant content: {raw}");
+            }
+            return self
+                .force_final_answer_without_tools_responses(session_id, ctx, "plain empty content")
+                .await;
+        }
+
+        if self.debug {
+            println!(
+                "[DEBUG] AI responses response ok model={} timeout_ms={} base_url={}",
+                self.model, self.timeout_ms, self.base_url
+            );
+        }
+
+        Ok(append_finish_reason_hint(reply, parsed.finish_reason))
     }
 
     async fn force_final_answer_without_tools(
@@ -562,6 +786,47 @@ impl OpenAiCompatibleLlm {
         Ok(Some(append_finish_reason_hint(reply, finish)))
     }
 
+    async fn force_final_answer_without_tools_responses(
+        &self,
+        session_id: String,
+        mut ctx: ResponsesContext,
+        reason: &str,
+    ) -> Result<String> {
+        let temperature = self.answer_temperature();
+        ctx.input.push(build_responses_text_message(
+            "system",
+            format!(
+                "工具流程已结束（reason={reason}）。请基于已有对话与工具结果直接输出最终答复文本。禁止继续调用工具，禁止输出空内容。若信息不足请明确说明缺少哪些信息。"
+            ),
+        ));
+
+        if self.debug {
+            println!(
+                "[DEBUG] forcing final responses no-tool answer session={} input={} temperature={:.2} reason={}",
+                session_id,
+                ctx.input.len(),
+                temperature,
+                reason
+            );
+        }
+
+        let payload =
+            self.build_responses_payload(&session_id, &ctx.instructions, &ctx.input, temperature, None);
+        let value = self.call_openai(payload).await?;
+        let parsed = parse_responses_output(&value)?;
+        let reply = parsed.content.trim().to_string();
+
+        if reply.is_empty() {
+            if self.debug {
+                let raw = truncate_debug_json(&parsed.assistant_output);
+                println!("[DEBUG] forced final responses still empty: {raw}");
+            }
+            return Ok(temporary_network_reply());
+        }
+
+        Ok(append_finish_reason_hint(reply, parsed.finish_reason))
+    }
+
     fn answer_temperature(&self) -> f32 {
         if !self.temperature.is_finite() {
             return 0.55;
@@ -576,7 +841,7 @@ impl OpenAiCompatibleLlm {
     }
 
     async fn call_openai(&self, payload: Value) -> Result<Value> {
-        let payload = apply_default_no_thinking_hints(payload);
+        let payload = self.prepare_openai_payload(payload);
         const MAX_ATTEMPTS: usize = 3;
 
         for attempt in 1..=MAX_ATTEMPTS {
@@ -631,12 +896,94 @@ impl OpenAiCompatibleLlm {
             }
 
             let value: Value = serde_json::from_str(&body)
-                .context("failed to parse chat completion response JSON")?;
+                .context("failed to parse AI response JSON")?;
             record_usage_from_openai_response(&value, self.debug);
             return Ok(value);
         }
 
         bail!("failed to call {} after retries", self.endpoint)
+    }
+
+    fn prepare_openai_payload(&self, payload: Value) -> Value {
+        match self.wire_api {
+            OpenAiWireApi::ChatCompletions => apply_default_no_thinking_hints(payload),
+            OpenAiWireApi::Responses => {
+                apply_responses_defaults(payload, &self.reasoning_effort, self.disable_response_storage)
+            }
+        }
+    }
+
+    fn build_responses_context(&self, request_messages: Vec<Value>) -> ResponsesContext {
+        let mut messages = request_messages;
+        normalize_system_messages(&mut messages);
+
+        let mut instructions = Vec::new();
+        let mut input = Vec::new();
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            match role {
+                "system" => {
+                    let text = message_content_as_text(&message);
+                    if !text.trim().is_empty() {
+                        instructions.push(text);
+                    }
+                }
+                "tool" => {
+                    let call_id = message
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    let output = message_content_as_text(&message);
+                    if !call_id.is_empty() && !output.trim().is_empty() {
+                        input.push(build_responses_function_call_output_item(call_id, &output));
+                    }
+                }
+                "assistant" => {
+                    if let Some(item) = convert_chat_message_to_responses_item(&message, "assistant") {
+                        input.push(item);
+                    }
+                }
+                _ => {
+                    if let Some(item) = convert_chat_message_to_responses_item(&message, "user") {
+                        input.push(item);
+                    }
+                }
+            }
+        }
+
+        ResponsesContext {
+            instructions: instructions.join("\n\n"),
+            input,
+        }
+    }
+
+    fn build_responses_payload(
+        &self,
+        _session_id: &str,
+        instructions: &str,
+        input: &[Value],
+        temperature: f32,
+        tools: Option<&Value>,
+    ) -> Value {
+        let mut payload = json!({
+            "model": self.model,
+            "input": input,
+            "temperature": temperature,
+            "max_output_tokens": self.max_tokens,
+        });
+
+        if !instructions.trim().is_empty() {
+            payload["instructions"] = Value::String(instructions.to_string());
+        }
+        if let Some(tools) = tools {
+            payload["tools"] = tools.clone();
+        }
+
+        payload
     }
 
     async fn build_request_messages(&self, messages: &[(String, String)]) -> Result<Vec<Value>> {
@@ -929,6 +1276,20 @@ struct OpenAiToolCall {
     arguments: Value,
 }
 
+#[derive(Debug, Clone)]
+struct ResponsesContext {
+    instructions: String,
+    input: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ResponsesOutput {
+    content: String,
+    tool_calls: Vec<OpenAiToolCall>,
+    assistant_output: Value,
+    finish_reason: Option<String>,
+}
+
 fn parse_openai_choice(
     value: &Value,
 ) -> Result<(String, Vec<OpenAiToolCall>, Value, Option<String>)> {
@@ -957,10 +1318,138 @@ fn parse_openai_choice(
     Ok((content, calls, message, finish_reason))
 }
 
+fn parse_responses_output(value: &Value) -> Result<ResponsesOutput> {
+    let output = value
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut text_chunks = Vec::new();
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            text_chunks.push(text.trim().to_string());
+        }
+    }
+
+    let mut tool_calls = Vec::new();
+    for (idx, item) in output.iter().enumerate() {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match item_type {
+            "message" => {
+                if let Some(content_parts) = item.get("content").and_then(Value::as_array) {
+                    for part in content_parts {
+                        let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                        match part_type {
+                            "output_text" | "text" | "input_text" => {
+                                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                    if !text.trim().is_empty() {
+                                        text_chunks.push(text.trim().to_string());
+                                    }
+                                }
+                            }
+                            "refusal" => {
+                                if let Some(text) = part
+                                    .get("refusal")
+                                    .or_else(|| part.get("text"))
+                                    .and_then(Value::as_str)
+                                {
+                                    if !text.trim().is_empty() {
+                                        text_chunks.push(text.trim().to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "function_call" | "tool_call" | "tool_use" => {
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .or_else(|| item.get("function").and_then(|v| v.get("name")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let arguments = if let Some(arguments) = item.get("arguments") {
+                    if let Some(text) = arguments.as_str() {
+                        parse_tool_arguments(text)
+                    } else {
+                        arguments.clone()
+                    }
+                } else if let Some(input) = item.get("input") {
+                    input.clone()
+                } else {
+                    json!({})
+                };
+
+                if !name.is_empty() {
+                    tool_calls.push(OpenAiToolCall {
+                        id: if id.is_empty() {
+                            format!("responses_tool_call_{idx}")
+                        } else {
+                            id
+                        },
+                        name,
+                        arguments,
+                    });
+                }
+            }
+            "output_text" | "text" => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        text_chunks.push(text.trim().to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let finish_reason = match (
+        value.get("status").and_then(Value::as_str),
+        value.get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str),
+    ) {
+        (Some("incomplete"), Some("max_output_tokens")) => Some("length".to_string()),
+        (Some("incomplete"), Some(reason)) if !reason.trim().is_empty() => Some(reason.to_string()),
+        _ => None,
+    };
+
+    Ok(ResponsesOutput {
+        content: text_chunks.join("\n").trim().to_string(),
+        tool_calls,
+        assistant_output: json!({
+            "status": value.get("status").cloned().unwrap_or(Value::Null),
+            "incomplete_details": value.get("incomplete_details").cloned().unwrap_or(Value::Null),
+            "output": output,
+        }),
+        finish_reason,
+    })
+}
+
 fn has_openai_tool_results(messages: &[Value]) -> bool {
     messages
         .iter()
         .any(|msg| msg.get("role").and_then(Value::as_str) == Some("tool"))
+}
+
+fn has_responses_tool_results(messages: &[Value]) -> bool {
+    messages.iter().any(|msg| {
+        matches!(
+            msg.get("type").and_then(Value::as_str),
+            Some("function_call_output")
+        )
+    })
 }
 
 fn has_reasoning_content(message: &Value) -> bool {
@@ -1027,10 +1516,27 @@ fn message_content_as_text(message: &Value) -> String {
     if let Some(parts) = message.get("content").and_then(Value::as_array) {
         let mut chunks = Vec::new();
         for part in parts {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    chunks.push(text.trim().to_string());
+            let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+            match part_type {
+                "text" | "input_text" | "output_text" => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        if !text.trim().is_empty() {
+                            chunks.push(text.trim().to_string());
+                        }
+                    }
                 }
+                "refusal" => {
+                    if let Some(text) = part
+                        .get("refusal")
+                        .or_else(|| part.get("text"))
+                        .and_then(Value::as_str)
+                    {
+                        if !text.trim().is_empty() {
+                            chunks.push(text.trim().to_string());
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         return chunks.join("\n");
@@ -1393,9 +1899,12 @@ fn latest_user_text(messages: &[Value]) -> Option<String> {
         let parts = msg.get("content").and_then(Value::as_array)?;
         let mut chunks = Vec::new();
         for part in parts {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    chunks.push(text.trim().to_string());
+            let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+            if matches!(part_type, "text" | "input_text" | "output_text") {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        chunks.push(text.trim().to_string());
+                    }
                 }
             }
         }
@@ -1678,6 +2187,123 @@ fn record_usage_from_openai_response(value: &Value, debug: bool) {
     }
 }
 
+fn resolve_openai_endpoint(base: &str, wire_api: OpenAiWireApi) -> String {
+    match wire_api {
+        OpenAiWireApi::ChatCompletions => {
+            if base.ends_with("/chat/completions") {
+                base.to_string()
+            } else {
+                format!("{base}/chat/completions")
+            }
+        }
+        OpenAiWireApi::Responses => {
+            if base.ends_with("/responses") {
+                base.to_string()
+            } else {
+                format!("{base}/responses")
+            }
+        }
+    }
+}
+
+fn convert_chat_message_to_responses_item(message: &Value, fallback_role: &str) -> Option<Value> {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_role);
+    let content = message.get("content")?;
+
+    if let Some(text) = content.as_str() {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(build_responses_text_message(role, trimmed.to_string()));
+    }
+
+    let parts = content.as_array()?;
+    let mut out_parts = Vec::new();
+    for part in parts {
+        let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+        match (role, part_type) {
+            ("user", "text") | ("user", "input_text") | ("system", "text") | ("system", "input_text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        out_parts.push(json!({ "type": "input_text", "text": text }));
+                    }
+                }
+            }
+            ("user", "image_url") => {
+                let image_url = part
+                    .get("image_url")
+                    .and_then(|value| value.get("url").or(Some(value)))
+                    .and_then(Value::as_str);
+                if let Some(url) = image_url {
+                    if !url.trim().is_empty() {
+                        out_parts.push(json!({ "type": "input_image", "image_url": url }));
+                    }
+                }
+            }
+            ("assistant", "text") | ("assistant", "input_text") | ("assistant", "output_text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        out_parts.push(json!({ "type": "input_text", "text": text }));
+                    }
+                }
+            }
+            ("assistant", "refusal") => {
+                if let Some(text) = part
+                    .get("refusal")
+                    .or_else(|| part.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    if !text.trim().is_empty() {
+                        out_parts.push(json!({ "type": "refusal", "refusal": text }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if out_parts.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "role": role,
+            "content": out_parts,
+        }))
+    }
+}
+
+fn build_responses_text_message(role: &str, text: impl Into<String>) -> Value {
+    let text = text.into();
+    json!({
+        "role": role,
+        "content": [{
+            "type": "input_text",
+            "text": text
+        }]
+    })
+}
+
+fn build_responses_function_call_item(call: &OpenAiToolCall) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call.id,
+        "name": call.name,
+        "arguments": call.arguments.to_string(),
+    })
+}
+
+fn build_responses_function_call_output_item(call_id: &str, output: &str) -> Value {
+    json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output,
+    })
+}
+
 fn openai_tools_schema() -> Value {
     json!([
         {
@@ -1741,6 +2367,64 @@ fn openai_tools_schema() -> Value {
                     },
                     "required": ["location"]
                 }
+            }
+        }
+    ])
+}
+
+fn openai_responses_tools_schema() -> Value {
+    json!([
+        {
+            "type": "function",
+            "name": "search_web",
+            "description": "Search the web for recent or external information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query keywords" }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "type": "function",
+            "name": "fetch_url",
+            "description": "Fetch and read webpage content by URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Full URL starting with http(s)://" }
+                },
+                "required": ["url"]
+            }
+        },
+        {
+            "type": "function",
+            "name": "get_system_info",
+            "description": "Read-only system information on this server. Supports full hardware/CPU/memory/disk/network status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "summary/hardware/cpu/memory/disk/network/load/uptime/all" }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "name": "get_process_info",
+            "description": "Read-only process info for XzBot (memory/CPU/uptime/disk IO).",
+            "parameters": { "type": "object", "properties": {} }
+        },
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get current weather by city/location name (current conditions only, not multi-day forecast).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": { "type": "string", "description": "City or location name, e.g. Chengdu, Beijing, New York" }
+                },
+                "required": ["location"]
             }
         }
     ])
@@ -1842,6 +2526,29 @@ fn apply_default_no_thinking_hints(mut payload: Value) -> Value {
         extra.insert("reasoning_effort".to_string(), json!("low"));
         extra.insert("thinking".to_string(), json!({ "type": "disabled" }));
         extra.insert("reasoning".to_string(), json!({ "enabled": false }));
+    }
+
+    payload
+}
+
+fn apply_responses_defaults(
+    mut payload: Value,
+    reasoning_effort: &str,
+    disable_response_storage: bool,
+) -> Value {
+    let Some(obj) = payload.as_object_mut() else {
+        return payload;
+    };
+
+    if disable_response_storage && !obj.contains_key("store") {
+        obj.insert("store".to_string(), json!(false));
+    }
+
+    if !reasoning_effort.trim().is_empty() && !obj.contains_key("reasoning") {
+        obj.insert(
+            "reasoning".to_string(),
+            json!({ "effort": reasoning_effort.trim() }),
+        );
     }
 
     payload

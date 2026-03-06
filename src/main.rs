@@ -55,6 +55,9 @@ mod store;
 mod token_stats;
 mod tools;
 
+/// Invisible marker inserted into POST-pushed messages so inbound event handling can ignore them.
+const POST_CONTEXT_MARKER: &str = "\u{2063}\u{2064}\u{2063}\u{2064}";
+
 /// Shared application state stored in axum router.
 #[derive(Clone)]
 struct AppState {
@@ -384,6 +387,8 @@ async fn post_send_handler(
         text.push_str(&format!("[CQ:image,file={}]", image_ref));
     }
     if !text.trim().is_empty() {
+        // Mark POST-pushed message so inbound pipeline can skip it from AI context.
+        text = format!("{POST_CONTEXT_MARKER}{text}");
         let action = if target.chat_type == "group" {
             ActionRequest::send_group_msg(target.group_id.unwrap_or_default(), text)
         } else {
@@ -564,6 +569,17 @@ async fn process_incoming(
         let runtime = state.runtime.read().await;
         (runtime.config.clone(), runtime.router.clone())
     };
+
+    if is_post_context_marker_message(&event) {
+        log_debug(
+            config.debug,
+            format!(
+                "skip post-marked message user_id={} group_id={:?}",
+                event.user_id, event.group_id
+            ),
+        );
+        return Vec::new();
+    }
 
     if let Err(err) = enrich_event_images(&mut event, bridge, config.debug).await {
         log_warn(format!("failed to enrich image context: {err}"));
@@ -1378,6 +1394,21 @@ fn normalize_image_ref(value: &str) -> String {
         .trim_matches('\'')
         .replace("&amp;", "&")
         .replace("&#38;", "&")
+}
+
+/// Returns true when message contains internal POST marker and should be excluded from routing/context.
+fn is_post_context_marker_message(event: &MessageEvent) -> bool {
+    if event.raw_message.starts_with(POST_CONTEXT_MARKER) {
+        return true;
+    }
+
+    if let MessagePayload::Text(text) = &event.message {
+        if text.starts_with(POST_CONTEXT_MARKER) {
+            return true;
+        }
+    }
+
+    event.text().starts_with(POST_CONTEXT_MARKER)
 }
 
 /// Extracts access token from headers or query params.

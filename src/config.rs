@@ -309,10 +309,19 @@ pub struct AiConfig {
     pub provider: AiProvider,
     /// Provider base URL.
     pub base_url: String,
+    /// OpenAI-compatible transport API shape.
+    #[serde(default = "default_openai_wire_api")]
+    pub wire_api: OpenAiWireApi,
     /// API key/token.
     pub api_key: String,
     /// Model id.
     pub model: String,
+    /// Reasoning effort hint for providers that support it.
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
+    /// Disables provider-side response storage when supported.
+    #[serde(default)]
+    pub disable_response_storage: bool,
     /// Sampling temperature.
     pub temperature: f32,
     /// Maximum output tokens.
@@ -423,6 +432,16 @@ impl AiProvider {
     }
 }
 
+/// OpenAI-compatible HTTP API wire format.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiWireApi {
+    /// Classic `/chat/completions` API.
+    ChatCompletions,
+    /// New `/responses` API.
+    Responses,
+}
+
 /// Vision handling mode for image inputs.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -460,6 +479,16 @@ fn default_trigger_mode() -> TriggerMode {
 /// Default Anthropic API version.
 fn default_anthropic_version() -> String {
     "2023-06-01".to_string()
+}
+
+/// Default OpenAI-compatible wire API.
+fn default_openai_wire_api() -> OpenAiWireApi {
+    OpenAiWireApi::ChatCompletions
+}
+
+/// Default reasoning effort hint.
+fn default_reasoning_effort() -> String {
+    "low".to_string()
 }
 
 /// Default vision mode.

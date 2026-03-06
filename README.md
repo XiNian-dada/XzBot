@@ -86,6 +86,31 @@ paddle_file_type = 1
 paddle_use_proxy = true
 ```
 
+### OpenAI Responses API 配置
+
+如果你的网关 **不兼容** `/chat/completions`，而是走新版 `/responses`，这样配：
+
+```toml
+[ai]
+provider = "openai_compatible"
+base_url = "https://cacode-sub2api-dev.hf.space/v1"
+wire_api = "responses"
+api_key = "YOUR_API_KEY"
+model = "gpt-5.4"
+reasoning_effort = "xhigh"
+disable_response_storage = true
+temperature = 0.7
+max_tokens = 4096
+timeout_ms = 60000
+```
+
+说明：
+
+1. `base_url` 填 API 根路径即可，XzBot 会自动补成 `/responses`
+2. 若你已经拿到完整地址，也可以直接填完整的 `.../responses`
+3. 老接口仍用 `wire_api = "chat_completions"`
+4. `disable_response_storage` 和 `reasoning_effort` 只对支持该字段的网关生效
+
 ### 代理配置
 
 所有 HTTP 请求默认走同一代理（LLM / 搜索 / OCR / fetch_url 等）。

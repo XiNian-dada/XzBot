@@ -141,15 +141,23 @@ proxy_timeout_ms = 5000
 [ai]
 # LLM 提供方：
 # - "mock"               : 本地 mock，返回 AI Reply: xxx（不调用外网）
-# - "openai_compatible"  : 调用 OpenAI 兼容接口（/chat/completions）
+# - "openai_compatible"  : 调用 OpenAI 兼容接口（/chat/completions 或 /responses）
 # - "anthropic_compatible": 调用 Anthropic 兼容接口（/messages，x-api-key）
 provider = "openai_compatible"
 
 # API 基础地址：
 # - openai_compatible: 例如 https://api.openai.com/v1
+#   若 wire_api = "chat_completions"，程序会补成 .../chat/completions
+#   若 wire_api = "responses"，程序会补成 .../responses
+#   也支持直接填写完整地址 .../chat/completions 或 .../responses
 # - anthropic_compatible: 例如 https://code.newcli.com/claude/aws/v1
 #   也支持直接填完整地址 .../messages
 base_url = "https://api.openai.com/v1"
+
+# OpenAI 兼容接口形态：
+# - "chat_completions" : 传统 Chat Completions
+# - "responses"        : 新版 Responses API（GPT-5/部分新网关常见）
+wire_api = "chat_completions"
 
 # API Key（真实接入时填写）
 # - openai_compatible 会走 Authorization: Bearer <api_key>
@@ -158,6 +166,13 @@ api_key = "REPLACE_WITH_YOUR_API_KEY"
 
 # 模型名
 model = "gpt-4.1-mini"
+
+# 推理强度提示（OpenAI Responses API / 部分兼容网关生效）
+# 常见值：low / medium / high / xhigh
+reasoning_effort = "low"
+
+# 是否禁止服务端保存响应（Responses API / 部分兼容网关生效）
+disable_response_storage = false
 
 # 视觉输入模式：
 # - "auto"        : 自动判断模型是否支持图片（默认）

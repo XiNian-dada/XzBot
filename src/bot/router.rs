@@ -49,6 +49,18 @@ impl BotRouter {
             return Ok(Vec::new());
         }
 
+        // Ignore bot self-message events to avoid polluting AI context and feedback loops.
+        if event.user_id == event.self_id {
+            log_debug(
+                self.config.debug,
+                format!(
+                    "skip self message user_id=self_id={} message_type={} group_id={:?}",
+                    event.self_id, event.message_type, event.group_id
+                ),
+            );
+            return Ok(Vec::new());
+        }
+
         if let Some(action) = self.handle_blacklist_command(&event) {
             return Ok(vec![action]);
         }
