@@ -1,4 +1,4 @@
-//! Anthropic-compatible backend with tool-calling and OCR/multimodal support.
+//! Anthropic 兼容模型接入：包含多模态、工具调用与降级逻辑。
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;

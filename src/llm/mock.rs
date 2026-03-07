@@ -1,4 +1,4 @@
-//! Mock LLM provider used for local end-to-end testing without real AI API.
+//! Mock 模型实现：用于本地联调，不访问真实大模型服务。
 
 use async_trait::async_trait;
 

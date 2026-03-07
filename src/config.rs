@@ -1,4 +1,10 @@
-//! Runtime configuration schema, defaults, loading and validation.
+//! 运行时配置模型：负责配置加载、默认值与跨字段校验。
+//!
+//! 配置模块的目标不是单纯“读 TOML”，而是在启动阶段尽早发现问题。
+//! 因此这里会把很多跨字段约束提前校验掉，例如：
+//! - 不同 AI 提供方所需的字段是否齐全
+//! - OCR / 搜索 / 代理等可选子系统的参数是否合法
+//! - 路由与群策略配置是否自洽
 
 use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
 

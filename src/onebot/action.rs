@@ -1,4 +1,4 @@
-//! OneBot v11 action request payload builders.
+//! OneBot 动作构造器：封装常用动作请求的 JSON 结构。
 
 use serde::Serialize;
 use serde_json::json;

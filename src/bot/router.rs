@@ -1,4 +1,11 @@
-//! High-level message routing: permission check, plugins, AI fallback.
+//! 机器人消息路由：负责权限判断、插件分发和 AI 回退处理。
+//!
+//! 路由层只做“决策”，不直接实现复杂业务：
+//! - 先判断消息类型、权限与群触发条件
+//! - 再尝试让插件接管
+//! - 最后才回落到 AI 对话插件
+//!
+//! 这样可以保证后续新增插件时，不需要把判断逻辑散落到多个业务模块。
 
 use std::sync::Arc;
 
@@ -107,7 +114,12 @@ impl BotRouter {
                 event.message_type, event.user_id, event.group_id
             ),
         );
-        Ok(self.ai_chat.handle_message(event).await?.into_iter().collect())
+        Ok(self
+            .ai_chat
+            .handle_message(event)
+            .await?
+            .into_iter()
+            .collect())
     }
 
     /// Gracefully shuts down all managed plugins.

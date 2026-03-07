@@ -1,4 +1,4 @@
-//! System/process inspection helpers exposed to tool-calling.
+//! 系统信息工具：提供只读的主机与进程运行状态查询。
 
 use anyhow::Result;
 use std::fs;

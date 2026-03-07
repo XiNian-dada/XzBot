@@ -1,4 +1,4 @@
-//! Chat-bound POST token storage for external push delivery.
+//! 外部 POST 推送令牌存储：把令牌安全绑定到具体聊天会话。
 
 use std::{
     collections::HashMap,

@@ -1,4 +1,4 @@
-//! Built-in tool implementations used by function calls.
+//! 工具模块入口：聚合搜索、天气、系统信息等函数调用能力。
 
 /// Shared HTTP client construction helpers.
 pub mod http;

@@ -1,4 +1,4 @@
-//! Helpers for splitting user content into text and image marker lists.
+//! 用户消息拆分工具：把文本、图片标记和附件引用拆成结构化片段。
 
 use std::collections::HashSet;
 

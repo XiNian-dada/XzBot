@@ -1,4 +1,4 @@
-//! Minimal logging helpers with leveled prefixes.
+//! 轻量日志模块：提供统一前缀与调试开关封装。
 
 use std::{
     collections::VecDeque,

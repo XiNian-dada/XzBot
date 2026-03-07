@@ -1,4 +1,4 @@
-//! Global token usage counters for observability.
+//! Token 统计模块：累计记录请求和响应的 token 消耗。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

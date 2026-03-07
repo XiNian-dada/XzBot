@@ -1,4 +1,11 @@
-//! AI chat plugin implementation and session orchestration.
+//! AI 对话插件：负责上下文拼装、LLM 调用和回复动作生成。
+//!
+//! 这个模块是“协议层”和“模型层”之间的胶水：
+//! - 从事件里提取当前用户真正想说的话
+//! - 读取并维护会话历史
+//! - 把回复转换成 OneBot Action
+//!
+//! 它本身不关心 HTTP、WebSocket 或搜索实现细节，只协调对话过程。
 
 use std::sync::Arc;
 

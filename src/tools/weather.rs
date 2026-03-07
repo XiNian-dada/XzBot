@@ -1,4 +1,4 @@
-//! Weather tool: current conditions API + web forecast reference synthesis.
+//! 天气工具：整合实时天气接口与网页预报摘要。
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -58,7 +58,10 @@ pub async fn get_weather(client: &Client, location: &str, debug: bool) -> Result
         }
         Err(err) => {
             if debug {
-                println!("[DEBUG] weather.reference failed location={} err={}", location, err);
+                println!(
+                    "[DEBUG] weather.reference failed location={} err={}",
+                    location, err
+                );
             }
         }
     }
@@ -286,9 +289,8 @@ async fn fetch_weather_reference(client: &Client, location: &str, debug: bool) -
     }
 
     // Prefer tianqi.2345.com for detailed multi-day forecasts; fallback to next best hit.
-    let picked = pick_weather_candidate(candidates).ok_or_else(|| {
-        anyhow::anyhow!("weather web search candidates have no valid result url")
-    })?;
+    let picked = pick_weather_candidate(candidates)
+        .ok_or_else(|| anyhow::anyhow!("weather web search candidates have no valid result url"))?;
     let preferred = is_preferred_weather_domain(&picked.url);
     let (page_title, page_text) = fetch_weather_page_summary(client, &picked.url).await?;
 
@@ -320,8 +322,8 @@ fn parse_bing_weather_candidates(html: &str) -> Result<Vec<WeatherCandidate>> {
     let doc = Html::parse_document(html);
     let item_sel = Selector::parse("li.b_algo")
         .map_err(|err| anyhow::anyhow!("failed to parse selector li.b_algo: {err}"))?;
-    let title_sel =
-        Selector::parse("h2 a").map_err(|err| anyhow::anyhow!("failed to parse selector h2 a: {err}"))?;
+    let title_sel = Selector::parse("h2 a")
+        .map_err(|err| anyhow::anyhow!("failed to parse selector h2 a: {err}"))?;
 
     let mut out = Vec::new();
     for item in doc.select(&item_sel).take(12) {
@@ -420,10 +422,10 @@ async fn fetch_weather_page_summary(client: &Client, url: &str) -> Result<(Strin
 fn extract_html_title_text(html: &str) -> Result<(String, String)> {
     // Keep extraction intentionally simple: title + full body text normalization.
     let doc = Html::parse_document(html);
-    let body_sel =
-        Selector::parse("body").map_err(|err| anyhow::anyhow!("failed to parse selector body: {err}"))?;
-    let title_sel =
-        Selector::parse("title").map_err(|err| anyhow::anyhow!("failed to parse selector title: {err}"))?;
+    let body_sel = Selector::parse("body")
+        .map_err(|err| anyhow::anyhow!("failed to parse selector body: {err}"))?;
+    let title_sel = Selector::parse("title")
+        .map_err(|err| anyhow::anyhow!("failed to parse selector title: {err}"))?;
 
     let title = doc
         .select(&title_sel)

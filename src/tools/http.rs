@@ -1,4 +1,4 @@
-//! Shared HTTP client builder with timeout/cookie/proxy options.
+//! 通用 HTTP 客户端构造器：统一超时、Cookie 和代理策略。
 
 use std::time::Duration;
 

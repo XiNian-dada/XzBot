@@ -1,4 +1,4 @@
-//! OneBot v11 event models and message parsing helpers.
+//! OneBot 事件模型：负责事件反序列化和消息内容提取。
 
 use serde::Deserialize;
 use serde_json::Value;

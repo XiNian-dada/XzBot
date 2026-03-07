@@ -1,4 +1,4 @@
-//! Image reference loading helpers for multimodal/OCR pipelines.
+//! 图片加载工具：把 URL、本地路径或 base64 引用转换为模型可消费的内容。
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};

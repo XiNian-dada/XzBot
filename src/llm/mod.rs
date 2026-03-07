@@ -1,4 +1,4 @@
-//! LLM provider abstraction and implementations.
+//! 大模型抽象层：定义统一接口并注册各类后端实现。
 
 use async_trait::async_trait;
 
@@ -10,10 +10,10 @@ pub mod image;
 pub mod message_parts;
 /// Local mock backend for offline testing.
 pub mod mock;
-/// OpenAI-compatible backend implementation.
-pub mod openai_compatible;
 /// OCR fallback pipeline for non-multimodal models.
 pub mod ocr;
+/// OpenAI-compatible backend implementation.
+pub mod openai_compatible;
 
 /// Unified chat interface used by the bot runtime.
 #[async_trait]

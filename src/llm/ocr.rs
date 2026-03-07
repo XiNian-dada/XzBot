@@ -1,4 +1,4 @@
-//! OCR fallback pipeline for image inputs when model vision is unavailable.
+//! OCR 回退流水线：在模型不支持视觉输入时提取图片文字。
 
 use std::{
     path::PathBuf,
@@ -55,8 +55,9 @@ pub async fn ocr_images_to_text(
     let mut success = 0usize;
     for (idx, image_ref) in image_refs.iter().take(3).enumerate() {
         let result = match settings.provider {
-            OcrProvider::Tesseract => ocr_single_image_tesseract(client, image_ref, settings, debug)
-                .await,
+            OcrProvider::Tesseract => {
+                ocr_single_image_tesseract(client, image_ref, settings, debug).await
+            }
             OcrProvider::Paddle => {
                 ocr_single_image_paddle(client, image_ref, settings, debug).await
             }
@@ -71,10 +72,7 @@ pub async fn ocr_images_to_text(
             }
             Err(err) => {
                 if debug {
-                    println!(
-                        "[DEBUG] ocr failed image_ref={} err={}",
-                        image_ref, err
-                    );
+                    println!("[DEBUG] ocr failed image_ref={} err={}", image_ref, err);
                 }
             }
         }
@@ -84,7 +82,10 @@ pub async fn ocr_images_to_text(
         return "图片OCR失败或未识别到文字。".to_string();
     }
 
-    format!("以下为图片 OCR 识别结果（可能有误）：\n{}", results.join("\n\n"))
+    format!(
+        "以下为图片 OCR 识别结果（可能有误）：\n{}",
+        results.join("\n\n")
+    )
 }
 
 /// OCR one image by downloading and invoking local tesseract.
@@ -155,7 +156,10 @@ async fn ocr_single_image_paddle(
 
     let request = client_ref
         .post(settings.paddle_endpoint.trim())
-        .header("Authorization", format!("token {}", settings.paddle_token.trim()))
+        .header(
+            "Authorization",
+            format!("token {}", settings.paddle_token.trim()),
+        )
         .header("Content-Type", "application/json")
         .header(
             "User-Agent",
@@ -176,7 +180,10 @@ async fn ocr_single_image_paddle(
         })?;
 
     let status = response.status();
-    let body = response.text().await.context("failed to read paddle ocr body")?;
+    let body = response
+        .text()
+        .await
+        .context("failed to read paddle ocr body")?;
     if !status.is_success() {
         let preview = body.chars().take(300).collect::<String>();
         bail!("paddle ocr http {}: {}", status, preview);
@@ -215,9 +222,7 @@ async fn ocr_single_image_paddle(
 /// Executes local tesseract command with timeout guard.
 async fn run_tesseract(path: &PathBuf, settings: &OcrSettings) -> Result<String> {
     let mut cmd = Command::new(&settings.cmd);
-    cmd.kill_on_drop(true)
-        .arg(path)
-        .arg("stdout");
+    cmd.kill_on_drop(true).arg(path).arg("stdout");
     if !settings.lang.trim().is_empty() {
         cmd.arg("-l").arg(settings.lang.trim());
     }

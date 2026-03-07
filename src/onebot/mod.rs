@@ -1,4 +1,4 @@
-//! OneBot v11 protocol data models.
+//! OneBot v11 协议模型总入口。
 
 /// Outgoing OneBot action payload builders.
 pub mod action;

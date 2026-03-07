@@ -1,4 +1,10 @@
-//! Managed external plugin runtime and IPC bridge.
+//! 插件运行时：负责外部插件发现、拉起、通信和生命周期管理。
+//!
+//! XzBot 的插件设计目标更接近“托管外部进程”，而不是把所有逻辑静态编译进主程序。
+//! 因此这里重点处理：
+//! - 插件目录扫描与配置解析
+//! - 子进程拉起、标准输入输出通信
+//! - 插件失败后的清理与重载
 
 use std::{
     collections::HashMap,
@@ -151,10 +157,11 @@ impl PluginManager {
                     resolved.display()
                 ));
             } else {
-                let file_name = reply
-                    .file_name
-                    .clone()
-                    .or_else(|| resolved.file_name().map(|s| s.to_string_lossy().to_string()));
+                let file_name = reply.file_name.clone().or_else(|| {
+                    resolved
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                });
                 let action = match event.message_type.as_str() {
                     "group" => {
                         let group_id = event.group_id.unwrap_or_default();
@@ -174,15 +181,13 @@ impl PluginManager {
             }
         }
 
-        if let Some(image_ref) = reply
-            .image_url
-            .clone()
-            .or_else(|| reply.image_path.clone())
-        {
+        if let Some(image_ref) = reply.image_url.clone().or_else(|| reply.image_path.clone()) {
             let resolved = if reply.image_url.is_some() {
                 image_ref
             } else {
-                resolve_plugin_path(&image_ref, &plugin.config_dir).to_string_lossy().to_string()
+                resolve_plugin_path(&image_ref, &plugin.config_dir)
+                    .to_string_lossy()
+                    .to_string()
             };
             if reply.image_url.is_none() && !Path::new(&resolved).exists() {
                 log_warn(format!(
@@ -309,12 +314,8 @@ impl ManagedPlugin {
             .await
             .context("failed to flush plugin stdin")?;
 
-        let response = read_response(
-            &mut process.stdout,
-            &request.request_id,
-            self.timeout_ms,
-        )
-        .await;
+        let response =
+            read_response(&mut process.stdout, &request.request_id, self.timeout_ms).await;
 
         *guard = Some(process);
         response

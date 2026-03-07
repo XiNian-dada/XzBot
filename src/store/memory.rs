@@ -1,4 +1,4 @@
-//! In-memory conversation context storage.
+//! 内存会话存储：维护对话历史、锁状态和上下文裁剪。
 
 use dashmap::DashMap;
 
