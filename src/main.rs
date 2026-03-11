@@ -13,6 +13,9 @@ mod token_stats;
 mod tools;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    app::run().await
+async fn main() {
+    if let Err(err) = app::run().await {
+        logger::error_err("application runtime failed", &err);
+        std::process::exit(1);
+    }
 }

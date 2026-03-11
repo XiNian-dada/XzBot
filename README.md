@@ -39,7 +39,98 @@ cargo build --release
 ./config/config.toml
 ```
 
-首次运行会自动生成模板配置（源自项目根目录的 `config.toml`）。
+首次运行会自动生成模板配置（源自项目根目录的 `config.default.toml`）。
+
+### 主配置 + 可选覆盖文件
+
+XzBot 现在采用“一个主配置 + 多个可选覆盖文件”的方式：
+
+1. 普通场景只改：
+   - `./config/config.toml`
+2. 高级场景可以额外新建：
+   - `./config/ai.toml`
+   - `./config/persona.toml`
+   - `./config/search.toml`
+   - `./config/network.toml`
+   - 以及 `server.toml` / `group.toml` / `policy.toml` / `owner.toml`
+
+这些覆盖文件现在会自动生成模板，并且每个文件默认都带：
+
+```toml
+enabled = false
+```
+
+含义是：
+
+- `false`：整份覆盖文件不生效
+- `true`：这份文件开始覆盖主配置里对应的部分
+
+加载顺序是：
+
+1. `config.toml`
+2. 其他同目录覆盖文件（若存在）
+
+后读取的文件会覆盖前面的同名字段。
+
+这意味着你可以渐进式地拆配置：
+
+1. 先只改 `config.toml`
+2. 某一块变长了，比如 persona
+3. 再把它搬到 `persona.toml`
+4. 把 `persona.toml` 的 `enabled` 改成 `true`
+
+例如，你可以把日常常改的配置留在 `config.toml`，再把很长的人设拆到 `persona.toml`：
+
+```toml
+[persona]
+system = "主配置里的简短默认人设"
+```
+
+然后在 `./config/persona.toml` 里覆盖：
+
+```toml
+[persona]
+system = """
+这里放完整的人设长文本
+"""
+
+[[persona.group_overrides]]
+groups = [970199915]
+system = """
+这个群使用单独的人设
+"""
+```
+
+分群人设机制没有变化，仍然使用 `[[persona.group_overrides]]`。
+
+### 旧版单文件配置迁移
+
+如果你是从旧版本升级而来，程序会自动检查旧布局：
+
+```text
+./config.toml
+```
+
+当新的主配置：
+
+```text
+./config/config.toml
+```
+
+不存在时，XzBot 会自动做一次“结构迁移”：
+
+1. 读取旧版单文件配置
+2. 把这些部分拆到独立覆盖文件并自动启用：
+   - `persona -> config/persona.toml`
+   - `ai -> config/ai.toml`
+   - `search -> config/search.toml`
+   - `network -> config/network.toml`
+3. 把剩余部分写入新的主配置：
+   - `config/config.toml`
+
+这样迁移后的主配置会更轻，复杂配置会自动分流到对应文件里。
+
+旧版 `config.toml` 不会被删除，你仍然可以自行备份或手动清理。
 
 **NapCat 反向 WS 连接地址：**
 ```
@@ -97,6 +188,7 @@ base_url = "https://cacode-sub2api-dev.hf.space/v1"
 wire_api = "responses"
 api_key = "YOUR_API_KEY"
 model = "gpt-5.4"
+fallback_models = ["gpt-4.1", "gpt-4o-mini"]
 reasoning_effort = "xhigh"
 disable_response_storage = true
 temperature = 0.7
@@ -110,6 +202,27 @@ timeout_ms = 60000
 2. 若你已经拿到完整地址，也可以直接填完整的 `.../responses`
 3. 老接口仍用 `wire_api = "chat_completions"`
 4. `disable_response_storage` 和 `reasoning_effort` 只对支持该字段的网关生效
+
+### 多模型回退
+
+如果同一个 provider / base_url / api_key 下有多个模型可用，可以配置一条回退链：
+
+```toml
+[ai]
+provider = "openai_compatible"
+base_url = "https://your-gateway.example/v1"
+api_key = "sk-xxx"
+model = "gpt-5.4"
+fallback_models = ["gpt-4.1", "gpt-4o-mini"]
+```
+
+当前行为：
+
+1. 先尝试 `model`
+2. 当前模型请求失败时，再按顺序尝试 `fallback_models`
+3. 全部失败后：
+   - 如果都是超时 / 429 / 5xx / upstream 这类瞬时错误，返回统一“网不好”提示
+   - 如果是确定性的配置或请求错误，保留原始报错
 
 ### 代理配置
 

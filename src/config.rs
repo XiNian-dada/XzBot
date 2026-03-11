@@ -6,14 +6,45 @@
 //! - OCR / 搜索 / 代理等可选子系统的参数是否合法
 //! - 路由与群策略配置是否自洽
 
-use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use toml::Value;
 
-const DEFAULT_CONFIG_TOML: &str = include_str!("../config.toml");
+const DEFAULT_CONFIG_TOML: &str = include_str!("../config.default.toml");
+const OPTIONAL_OVERRIDE_FILES: &[&str] = &[
+    "owner.toml",
+    "server.toml",
+    "policy.toml",
+    "group.toml",
+    "persona.toml",
+    "ai.toml",
+    "search.toml",
+    "network.toml",
+];
+const STRUCTURED_OVERLAY_MAPPINGS: &[(&str, &str)] = &[
+    ("persona.toml", "persona"),
+    ("ai.toml", "ai"),
+    ("search.toml", "search"),
+    ("network.toml", "network"),
+];
 
-/// Root runtime configuration loaded from `config.toml`.
+/// 根运行时配置。
+///
+/// 加载顺序是：
+/// 1. 读取主配置 `config/config.toml`
+/// 2. 再按固定顺序读取同目录下的可选覆盖文件
+/// 3. 把所有 TOML 表递归合并后反序列化成最终 `Config`
+///
+/// 这样可以同时满足两类用户：
+/// - 普通用户只改一个主配置文件
+/// - 高级用户把 AI / Persona / Network 等大块配置拆到单独文件里
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Global debug logging switch.
@@ -40,40 +71,38 @@ pub struct Config {
 }
 
 impl Config {
-    /// Loads config from disk, auto-creates default config when missing, then validates.
+    /// 从磁盘加载配置。
+    ///
+    /// 如果主配置不存在，会先自动生成一份“精简默认模板”。
+    /// 可选覆盖文件不存在时会被直接忽略。
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let raw = match fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!(
-                            "config file not found and failed to create config directory {}",
-                            parent.display()
-                        )
-                    })?;
-                }
-                fs::write(path, DEFAULT_CONFIG_TOML).with_context(|| {
-                    format!(
-                        "config file not found and failed to create default config at {}",
-                        path.display()
-                    )
-                })?;
-                fs::read_to_string(path).with_context(|| {
-                    format!(
-                        "default config was created but failed to read it from {}",
-                        path.display()
-                    )
-                })?
+        try_migrate_legacy_config(path)?;
+        ensure_main_config_exists(path)?;
+        ensure_optional_override_files(path.parent().unwrap_or_else(|| Path::new(".")))?;
+
+        let mut merged = read_toml_value(path)?;
+        let config_dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        for file_name in OPTIONAL_OVERRIDE_FILES {
+            let overlay_path = config_dir.join(file_name);
+            if !overlay_path.exists() {
+                continue;
             }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to read config file: {}", path.display()))
+            let mut overlay = read_toml_value(&overlay_path)?;
+            if !overlay_file_enabled(&overlay) {
+                continue;
             }
-        };
-        let config: Config = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse TOML from {}", path.display()))?;
+            strip_overlay_control_keys(&mut overlay);
+            merge_toml_value(&mut merged, overlay);
+        }
+
+        let config: Config = merged.try_into().with_context(|| {
+            format!("failed to parse merged config rooted at {}", path.display())
+        })?;
         config
             .validate()
             .with_context(|| format!("invalid config in {}", path.display()))?;
@@ -111,6 +140,16 @@ impl Config {
         }
         if self.ai.model.trim().is_empty() {
             bail!("ai.model cannot be empty");
+        }
+        let mut seen_models = HashSet::new();
+        seen_models.insert(self.ai.model.trim().to_string());
+        for (idx, model) in self.ai.fallback_models.iter().enumerate() {
+            if model.trim().is_empty() {
+                bail!("ai.fallback_models[{idx}] cannot be empty");
+            }
+            if !seen_models.insert(model.trim().to_string()) {
+                bail!("ai.fallback_models[{idx}] duplicates another configured model");
+            }
         }
         if self.ai.base_url.trim().is_empty() {
             bail!("ai.base_url cannot be empty");
@@ -188,6 +227,318 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+/// 尝试把旧版“单文件配置”迁移到新的 `config/` 目录结构。
+///
+/// 旧版布局：
+/// - `<exe_dir>/config.toml`
+///
+/// 新版布局：
+/// - `<exe_dir>/config/config.toml`
+///
+/// 为了避免覆盖用户已有的新配置，这里只会在“新主配置不存在”时执行一次迁移。
+///
+/// 迁移策略不是简单复制，而是：
+/// 1. 把旧配置中 `persona / ai / search / network` 拆到各自覆盖文件
+/// 2. 这些覆盖文件会自动写入 `enabled = true`
+/// 3. 主配置只保留其余顶层字段，使新版 `config.toml` 更轻量
+fn try_migrate_legacy_config(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    let Some(config_dir) = path.parent() else {
+        return Ok(());
+    };
+    let Some(exe_dir) = config_dir.parent() else {
+        return Ok(());
+    };
+    let legacy_path = exe_dir.join("config.toml");
+    if !legacy_path.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(config_dir).with_context(|| {
+        format!(
+            "failed to create config directory for legacy migration: {}",
+            config_dir.display()
+        )
+    })?;
+
+    let legacy_value = read_toml_value(&legacy_path)?;
+    let mut legacy_table = match legacy_value {
+        Value::Table(table) => table,
+        _ => bail!(
+            "legacy config root must be a TOML table: {}",
+            legacy_path.display()
+        ),
+    };
+
+    for (file_name, section_key) in STRUCTURED_OVERLAY_MAPPINGS {
+        let Some(section_value) = legacy_table.remove(*section_key) else {
+            continue;
+        };
+        let overlay_path = config_dir.join(file_name);
+        if overlay_path.exists() {
+            continue;
+        }
+
+        let mut overlay_table = toml::map::Map::new();
+        overlay_table.insert("enabled".to_string(), Value::Boolean(true));
+        overlay_table.insert((*section_key).to_string(), section_value);
+        write_toml_value(
+            &overlay_path,
+            &Value::Table(overlay_table),
+            Some(&format!("Migrated from legacy {}", legacy_path.display())),
+        )?;
+    }
+
+    write_toml_value(
+        path,
+        &Value::Table(legacy_table),
+        Some(&format!("Migrated from legacy {}", legacy_path.display())),
+    )?;
+    Ok(())
+}
+
+/// 确保主配置文件存在；不存在时创建默认模板。
+fn ensure_main_config_exists(path: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "config file not found and failed to create config directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            fs::write(path, DEFAULT_CONFIG_TOML).with_context(|| {
+                format!(
+                    "config file not found and failed to create default config at {}",
+                    path.display()
+                )
+            })?;
+            Ok(())
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to stat config file: {}", path.display()))
+        }
+    }
+}
+
+/// 确保所有可选覆盖文件都存在。
+///
+/// 这些文件默认都是“关闭状态”，主要作用是把可扩展点显式摆给用户看，
+/// 避免用户根本不知道某一类配置可以拆出去。
+fn ensure_optional_override_files(config_dir: &Path) -> Result<()> {
+    fs::create_dir_all(config_dir).with_context(|| {
+        format!(
+            "failed to ensure config directory exists: {}",
+            config_dir.display()
+        )
+    })?;
+
+    for file_name in OPTIONAL_OVERRIDE_FILES {
+        let path = config_dir.join(file_name);
+        if path.exists() {
+            continue;
+        }
+        fs::write(&path, optional_override_template(file_name)).with_context(|| {
+            format!(
+                "failed to create optional override config file: {}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+/// 读取一个 TOML 文件为 `toml::Value`。
+///
+/// 空文件会被视为空表，便于把覆盖文件当作“占位配置”存在。
+fn read_toml_value(path: &Path) -> Result<Value> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(Value::Table(Default::default()));
+    }
+    toml::from_str(&raw).with_context(|| format!("failed to parse TOML from {}", path.display()))
+}
+
+/// 以可读的 TOML 格式写出配置文件，并可选附带一行迁移说明注释。
+fn write_toml_value(path: &Path, value: &Value, comment: Option<&str>) -> Result<()> {
+    let body = toml::to_string_pretty(value)
+        .with_context(|| format!("failed to serialize TOML for {}", path.display()))?;
+    let content = match comment {
+        Some(comment) => format!("# {comment}\n\n{body}"),
+        None => body,
+    };
+    fs::write(path, content)
+        .with_context(|| format!("failed to write config file {}", path.display()))
+}
+
+/// 递归合并 TOML 值。
+///
+/// 规则很简单：
+/// - 表对表：递归合并
+/// - 其他类型：覆盖值替换原值
+///
+/// 这意味着：
+/// - `persona.toml` 可以只覆盖 `[persona]`
+/// - `ai.toml` 可以只覆盖 `[ai]` 中的一小部分字段
+fn merge_toml_value(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Table(base_table), Value::Table(overlay_table)) => {
+            for (key, overlay_value) in overlay_table {
+                match base_table.get_mut(&key) {
+                    Some(base_value) => merge_toml_value(base_value, overlay_value),
+                    None => {
+                        base_table.insert(key, overlay_value);
+                    }
+                }
+            }
+        }
+        (base_slot, overlay_value) => {
+            *base_slot = overlay_value;
+        }
+    }
+}
+
+/// 判断一个可选覆盖文件是否启用。
+///
+/// 规则：
+/// - 未声明 `enabled`：视为启用，用于兼容旧写法
+/// - `enabled = false`：整份文件跳过
+fn overlay_file_enabled(value: &Value) -> bool {
+    value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// 去掉覆盖文件里的控制字段，避免它被误并入最终配置。
+fn strip_overlay_control_keys(value: &mut Value) {
+    if let Value::Table(table) = value {
+        table.remove("enabled");
+    }
+}
+
+/// 返回某个可选覆盖文件的默认模板。
+///
+/// 模板有两个设计原则：
+/// 1. 默认 `enabled = false`，保证生成后不会改变现有行为
+/// 2. 只展示“这一类配置能放什么”，不强迫用户一开始就理解全部细节
+fn optional_override_template(file_name: &str) -> &'static str {
+    match file_name {
+        "owner.toml" => {
+            r#"# 可选覆盖：主人配置
+# 关闭时本文件完全忽略。
+enabled = false
+
+[owner]
+# qq = 123456789
+"#
+        }
+        "server.toml" => {
+            r#"# 可选覆盖：服务监听配置
+enabled = false
+
+[server]
+# host = "0.0.0.0"
+# port = 3000
+# ws_path = "/onebot/v11/ws"
+# access_token = ""
+# verify_token = false
+"#
+        }
+        "policy.toml" => {
+            r#"# 可选覆盖：权限策略
+enabled = false
+
+[policy]
+# permission = "whitelist"
+"#
+        }
+        "group.toml" => {
+            r#"# 可选覆盖：群触发与白黑名单
+enabled = false
+
+[group]
+# whitelist = [123456789]
+# blacklist = []
+# trigger_mode = "at"
+# prefixes = ["/xzbot"]
+# keywords = ["xzbot"]
+# require_at = false
+# mention_sender = true
+"#
+        }
+        "persona.toml" => {
+            r#"# 可选覆盖：人设配置
+# 分群人设仍然使用 [[persona.group_overrides]]
+enabled = false
+
+[persona]
+# system = """
+# 这里可以放更长的人设文本
+# """
+
+#[[persona.group_overrides]]
+#groups = [970199915]
+#system = """
+# 这个群使用单独人设
+# """
+"#
+        }
+        "ai.toml" => {
+            r#"# 可选覆盖：AI 与 OCR 相关配置
+enabled = false
+
+[ai]
+# provider = "openai_compatible"
+# base_url = "https://api.openai.com/v1"
+# api_key = ""
+# model = "gpt-4.1-mini"
+# fallback_models = ["gpt-4.1-nano", "gpt-4o-mini"]
+# temperature = 0.7
+# max_tokens = 512
+# timeout_ms = 20000
+# wire_api = "chat_completions"
+# reasoning_effort = "low"
+# disable_response_storage = false
+# vision_mode = "auto"
+# ocr_provider = "tesseract"
+# ocr_cmd = "tesseract"
+# ocr_lang = "chi_sim+eng"
+# ocr_timeout_ms = 8000
+"#
+        }
+        "search.toml" => {
+            r#"# 可选覆盖：搜索配置
+enabled = false
+
+[search]
+# provider = "builtin"
+# searxng_url = ""
+"#
+        }
+        "network.toml" => {
+            r#"# 可选覆盖：网络与代理配置
+enabled = false
+
+[network]
+# proxy_enabled = false
+# proxy_url = ""
+# proxy_test_url = "https://www.baidu.com"
+# proxy_timeout_ms = 5000
+"#
+        }
+        _ => "enabled = false\n",
     }
 }
 
@@ -322,6 +673,9 @@ pub struct AiConfig {
     pub api_key: String,
     /// Model id.
     pub model: String,
+    /// Additional model ids used as fallback chain.
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
     /// Reasoning effort hint for providers that support it.
     #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
@@ -373,6 +727,23 @@ pub struct AiConfig {
     /// Whether Paddle OCR requests should use configured proxy.
     #[serde(default = "default_paddle_use_proxy")]
     pub paddle_use_proxy: bool,
+}
+
+impl AiConfig {
+    /// 返回按调用顺序排列的模型链。
+    ///
+    /// 第一个永远是主模型 `model`，后面依次接 `fallback_models`。
+    pub fn model_chain(&self) -> Vec<String> {
+        let mut models = Vec::with_capacity(1 + self.fallback_models.len());
+        models.push(self.model.clone());
+        for model in &self.fallback_models {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() {
+                models.push(trimmed.to_string());
+            }
+        }
+        models
+    }
 }
 
 /// Search backend configuration.

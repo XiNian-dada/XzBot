@@ -22,6 +22,7 @@ use crate::{
         message_parts::{parse_user_content, ParsedUserContent},
         ocr::{ocr_images_to_text, OcrSettings},
     },
+    logger::warn_err as log_warn_err,
     token_stats,
     tools::system::{get_process_info, get_system_info},
     tools::weather::get_weather,
@@ -56,6 +57,7 @@ pub struct OpenAiCompatibleLlm {
     max_tokens: u32,
     timeout_ms: u64,
     debug: bool,
+    suppress_transient_errors: bool,
     search: SearchConfig,
     network: NetworkConfig,
     vision_mode: VisionMode,
@@ -126,6 +128,7 @@ impl OpenAiCompatibleLlm {
         search: &SearchConfig,
         network: &NetworkConfig,
         debug: bool,
+        suppress_transient_errors: bool,
     ) -> Result<Self> {
         let base = config.base_url.trim_end_matches('/').to_string();
         let endpoint = resolve_openai_endpoint(&base, config.wire_api);
@@ -145,6 +148,7 @@ impl OpenAiCompatibleLlm {
             max_tokens: config.max_tokens,
             timeout_ms: config.timeout_ms,
             debug,
+            suppress_transient_errors,
             search: search.clone(),
             network: network.clone(),
             vision_mode: config.vision_mode,
@@ -193,18 +197,32 @@ impl Llm for OpenAiCompatibleLlm {
                 match with_tools {
                     Ok(v) => v,
                     Err(err) => {
+                        log_warn_err(
+                            format!(
+                                "openai tool mode failed model={} endpoint={}, fallback to plain chat",
+                                self.model, self.endpoint
+                            ),
+                            &err,
+                        );
                         if self.debug {
                             println!("[DEBUG] openai tool mode failed, fallback plain chat: {err}");
                         }
                         match self.chat_plain(session_id, request_messages).await {
                             Ok(v) => v,
                             Err(plain_err) => {
+                                log_warn_err(
+                                    format!(
+                                        "openai plain fallback failed model={} endpoint={}, returning transient reply",
+                                        self.model, self.endpoint
+                                    ),
+                                    &plain_err,
+                                );
                                 if self.debug {
                                     println!(
                                         "[DEBUG] openai plain fallback failed, return transient message: {plain_err:#}"
                                     );
                                 }
-                                temporary_network_reply()
+                                return self.transient_reply_or_err(plain_err);
                             }
                         }
                     }
@@ -221,6 +239,13 @@ impl Llm for OpenAiCompatibleLlm {
                 match with_tools {
                     Ok(v) => v,
                     Err(err) => {
+                        log_warn_err(
+                            format!(
+                                "openai responses tool mode failed model={} endpoint={}, fallback to plain chat",
+                                self.model, self.endpoint
+                            ),
+                            &err,
+                        );
                         if self.debug {
                             println!(
                                 "[DEBUG] openai responses tool mode failed, fallback plain chat: {err}"
@@ -232,12 +257,19 @@ impl Llm for OpenAiCompatibleLlm {
                         {
                             Ok(v) => v,
                             Err(plain_err) => {
+                                log_warn_err(
+                                    format!(
+                                        "openai responses plain fallback failed model={} endpoint={}, returning transient reply",
+                                        self.model, self.endpoint
+                                    ),
+                                    &plain_err,
+                                );
                                 if self.debug {
                                     println!(
                                         "[DEBUG] openai responses plain fallback failed, return transient message: {plain_err:#}"
                                     );
                                 }
-                                temporary_network_reply()
+                                return self.transient_reply_or_err(plain_err);
                             }
                         }
                     }
@@ -595,7 +627,7 @@ impl OpenAiCompatibleLlm {
                     return Ok(retry_reply);
                 }
             }
-            return Ok(temporary_network_reply());
+            return self.transient_reply_or_err(anyhow!("AI endpoint returned empty content"));
         }
         let (reply, continued) = self
             .maybe_continue_if_truncated(
@@ -717,7 +749,7 @@ impl OpenAiCompatibleLlm {
                 let raw = truncate_debug_json(&parsed.assistant_output);
                 println!("[DEBUG] forced final responses still empty: {raw}");
             }
-            return Ok(temporary_network_reply());
+            return self.transient_reply_or_err(anyhow!("AI endpoint returned empty content"));
         }
 
         Ok(append_finish_reason_hint(reply, parsed.finish_reason))
@@ -734,6 +766,21 @@ impl OpenAiCompatibleLlm {
     fn tool_planning_temperature(&self) -> f32 {
         // 工具选择阶段用更低温度，减少误选工具和幻觉。
         (self.answer_temperature() * 0.4).clamp(0.05, 0.25)
+    }
+
+    /// 根据当前实例模式决定：是直接给用户返回临时网络提示，还是把错误继续抛给上层回退链。
+    fn transient_reply_or_err(&self, err: anyhow::Error) -> Result<String> {
+        if self.suppress_transient_errors {
+            log_warn_err(
+                format!(
+                    "all retries exhausted for model={} endpoint={}, returning transient reply",
+                    self.model, self.endpoint
+                ),
+                &err,
+            );
+            return Ok(temporary_network_reply());
+        }
+        Err(err)
     }
 
     /// 发送一次 HTTP 请求到 OpenAI 兼容网关，并统一做重试与 usage 记录。

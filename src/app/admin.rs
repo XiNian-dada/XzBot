@@ -63,7 +63,7 @@ pub(super) async fn try_reload_config_command(
             Some(reload_reply_action(event, msg))
         }
         Err(err) => {
-            log_error(format!("reload config failed: {err:#}"));
+            log_error_err("reload config failed", &err);
             Some(reload_reply_action(event, format!("配置重载失败：{err}")))
         }
     }

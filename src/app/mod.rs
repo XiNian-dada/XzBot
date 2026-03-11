@@ -41,9 +41,12 @@ use crate::{
     config::{AiProvider, Config, NetworkConfig},
     llm::{
         anthropic_compatible::AnthropicCompatibleLlm, mock::MockLlm,
-        openai_compatible::OpenAiCompatibleLlm, Llm,
+        openai_compatible::OpenAiCompatibleLlm, FallbackLlm, Llm,
     },
-    logger::{debug as log_debug, error as log_error, info as log_info, warn as log_warn},
+    logger::{
+        debug as log_debug, error as log_error, error_err as log_error_err, info as log_info,
+        warn as log_warn, warn_err as log_warn_err,
+    },
     onebot::action::ActionRequest,
     onebot::event::{extract_cq_image_refs, MessageEvent, MessagePayload},
     plugins::PluginManager,
@@ -213,30 +216,52 @@ fn build_runtime(
     store: Arc<MemoryStore>,
     plugins: PluginManager,
 ) -> anyhow::Result<RuntimeState> {
-    let llm: Arc<dyn Llm> = match config.ai.provider {
-        AiProvider::Mock => Arc::new(MockLlm::new(
-            config.debug,
-            config.ai.timeout_ms,
-            config.search.clone(),
-            config.network.clone(),
-        )?),
-        AiProvider::OpenaiCompatible => Arc::new(OpenAiCompatibleLlm::from_config(
-            &config.ai,
-            &config.search,
-            &config.network,
-            config.debug,
-        )?),
-        AiProvider::AnthropicCompatible => Arc::new(AnthropicCompatibleLlm::from_config(
-            &config.ai,
-            &config.search,
-            &config.network,
-            config.debug,
-        )?),
-    };
+    let llm = build_llm_chain(&config)?;
     let ai_chat = AiChatPlugin::new(store, llm, config.clone());
     let router = Arc::new(BotRouter::new(ai_chat, plugins, config.clone()));
 
     Ok(RuntimeState { router, config })
+}
+
+/// 根据配置构建一条 LLM 回退链。
+///
+/// 逻辑是：
+/// - `ai.model` 作为主模型
+/// - `ai.fallback_models` 依次作为候补
+/// - 所有候选共享同一套 provider/base_url/api_key 等参数
+fn build_llm_chain(config: &Arc<Config>) -> anyhow::Result<Arc<dyn Llm>> {
+    let mut candidates = Vec::new();
+
+    for model in config.ai.model_chain() {
+        let mut ai_config = config.ai.clone();
+        ai_config.model = model.clone();
+
+        let llm: Arc<dyn Llm> = match ai_config.provider {
+            AiProvider::Mock => Arc::new(MockLlm::new(
+                config.debug,
+                ai_config.timeout_ms,
+                config.search.clone(),
+                config.network.clone(),
+            )?),
+            AiProvider::OpenaiCompatible => Arc::new(OpenAiCompatibleLlm::from_config(
+                &ai_config,
+                &config.search,
+                &config.network,
+                config.debug,
+                false,
+            )?),
+            AiProvider::AnthropicCompatible => Arc::new(AnthropicCompatibleLlm::from_config(
+                &ai_config,
+                &config.search,
+                &config.network,
+                config.debug,
+            )?),
+        };
+
+        candidates.push((model, llm));
+    }
+
+    Ok(Arc::new(FallbackLlm::new(candidates, config.debug)))
 }
 
 /// 启动时检查代理是否可用。
@@ -648,7 +673,7 @@ async fn process_incoming(
 
     // 富化失败不拦截消息主流程，只记录警告。否则图片链路偶发失败会让整个机器人失语。
     if let Err(err) = enrich_event_images(&mut event, bridge, config.debug).await {
-        log_warn(format!("failed to enrich image context: {err}"));
+        log_warn_err("failed to enrich image context", &err);
     }
 
     log_debug(
@@ -681,7 +706,7 @@ async fn process_incoming(
     let actions = match router.route_message(event).await {
         Ok(action) => action,
         Err(err) => {
-            log_error(format!("route message failed: {err}"));
+            log_error_err("route message failed", &err);
             return Vec::new();
         }
     };

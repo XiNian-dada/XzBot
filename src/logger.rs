@@ -5,6 +5,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use anyhow::Error;
+
 const MAX_RECENT_LOG_LINES: usize = 5000;
 static RECENT_LOGS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 
@@ -39,6 +41,16 @@ pub fn error(msg: impl AsRef<str>) {
     push_recent(line);
 }
 
+/// Logs an error-level message and appends the complete anyhow error chain.
+pub fn error_err(msg: impl AsRef<str>, err: &Error) {
+    error(format!("{}: {}", msg.as_ref(), format_error_chain(err)));
+}
+
+/// Logs a warning-level message and appends the complete anyhow error chain.
+pub fn warn_err(msg: impl AsRef<str>, err: &Error) {
+    warn(format!("{}: {}", msg.as_ref(), format_error_chain(err)));
+}
+
 /// Logs a debug-level message when `enabled` is true.
 pub fn debug(enabled: bool, msg: impl AsRef<str>) {
     if enabled {
@@ -61,4 +73,25 @@ pub fn recent_lines(limit: usize) -> Vec<String> {
         .skip(guard.len().saturating_sub(take))
         .cloned()
         .collect()
+}
+
+/// Formats one `anyhow::Error` into a readable single-line chain for console/log buffer output.
+pub fn format_error_chain(err: &Error) -> String {
+    let mut parts = Vec::new();
+    for cause in err.chain() {
+        let text = cause.to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        if parts.last() == Some(&text) {
+            continue;
+        }
+        parts.push(text);
+    }
+
+    if parts.is_empty() {
+        "unknown error".to_string()
+    } else {
+        parts.join(" | caused by: ")
+    }
 }
