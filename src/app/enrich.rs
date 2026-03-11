@@ -1,6 +1,12 @@
 //! 事件富化子模块：补全图片 URL、引用文本和上下文附加信息。
 //!
-//! 这部分逻辑主要为了让后续 AI 处理看到更完整的上下文，因此单独拆开，便于后续继续加强。
+//! 这里的职责是把 OneBot 原始事件里“不够直接可用”的上下文补齐出来，
+//! 但不篡改原始消息语义：
+//! - 原始上报仍保留在 `raw_message` / `message`
+//! - 运行时额外解析出来的引用文本、图片 URL 统一放进 `MessageEvent::enriched_parts`
+//!
+//! 这样后续无论是 AI、插件还是普通路由，只要走 `event.text()`，
+//! 就能看到同一份稳定的富化结果。
 
 use super::*;
 
@@ -10,7 +16,7 @@ use super::*;
 /// 整理成更适合后续 AI 读取的输入：
 /// - 能直接拿到 URL 的图片，补成统一形式
 /// - 只有 file id 的图片，尝试调用 `get_image` 解析
-/// - 引用消息里的文字，也追加到当前 `raw_message`
+/// - 引用消息里的文字，也追加到事件的富化上下文里
 pub(super) async fn enrich_event_images(
     event: &mut MessageEvent,
     bridge: &WsActionBridge,
@@ -92,30 +98,26 @@ pub(super) async fn enrich_event_images(
         }
     }
 
-    if !quote_texts.is_empty() {
-        if !event.raw_message.is_empty() {
-            event.raw_message.push(' ');
+    let quote_count = quote_texts.len();
+    if quote_count > 0 {
+        for quote_text in quote_texts {
+            event.push_enriched_part(quote_text);
         }
-        event.raw_message.push_str(&quote_texts.join(" "));
         log_debug(
             debug,
-            format!("event quote context enriched count={}", quote_texts.len()),
+            format!("event quote context enriched count={quote_count}"),
         );
     }
 
-    if !urls.is_empty() {
-        if !event.raw_message.is_empty() {
-            event.raw_message.push(' ');
-        }
-        for (idx, url) in urls.iter().enumerate() {
-            if idx > 0 {
-                event.raw_message.push(' ');
-            }
-            event.raw_message.push_str(&format!("[CQ:image,url={url}]"));
+    let url_count = urls.len();
+    if url_count > 0 {
+        for url in &urls {
+            // 使用内部统一的 `[IMAGE:...]` 标记，保证 AI / 插件链路都能一致识别。
+            event.push_enriched_part(format!("[IMAGE:url={url}]"));
         }
         log_debug(
             debug,
-            format!("event image context enriched urls={}", urls.len()),
+            format!("event image context enriched urls={url_count}"),
         );
     }
 

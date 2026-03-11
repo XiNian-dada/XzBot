@@ -26,6 +26,12 @@ pub struct MessageEvent {
     /// Structured message payload when provider sends segment array.
     #[serde(default)]
     pub message: MessagePayload,
+    /// Runtime-enriched text/image context appended after base message text.
+    ///
+    /// 这部分不来自 OneBot 原始上报，而是在运行时通过 `get_msg` / `get_image`
+    /// 等补充出来，供后续 AI 与路由统一读取。
+    #[serde(skip)]
+    pub enriched_parts: Vec<String>,
 }
 
 /// Message payload variants used by different OneBot implementations.
@@ -76,6 +82,24 @@ pub struct CqImageRef {
 impl MessageEvent {
     /// Returns normalized text with image markers merged from segments and raw CQ message.
     pub fn text(&self) -> String {
+        let mut text = self.base_text();
+        for part in &self.enriched_parts {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(trimmed);
+        }
+        text
+    }
+
+    /// Returns normalized text produced only from original OneBot payload.
+    ///
+    /// 与 `text()` 的区别在于：这里不包含运行时补充的引用文本、解析后图片 URL 等附加上下文。
+    fn base_text(&self) -> String {
         // 优先使用结构化消息段，图片/at 等内容在这里更完整。
         if let MessagePayload::Segments(segments) = &self.message {
             let mut normalized = segments_to_text(segments);
@@ -115,6 +139,17 @@ impl MessageEvent {
         }
 
         String::new()
+    }
+
+    /// Appends one runtime-generated context fragment.
+    ///
+    /// 这里的片段会被 `text()` 自动接到原始消息后面，而不会污染 `raw_message`。
+    pub fn push_enriched_part(&mut self, part: impl Into<String>) {
+        let part = part.into();
+        if part.trim().is_empty() {
+            return;
+        }
+        self.enriched_parts.push(part);
     }
 
     /// Returns best-effort sender display name.
