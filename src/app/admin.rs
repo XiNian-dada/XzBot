@@ -14,6 +14,7 @@ pub(super) struct ReloadOutcome {
     pub(super) config: Arc<Config>,
     pub(super) server_rebind_required: bool,
     pub(super) plugin_names: Vec<String>,
+    pub(super) plugin_tool_names: Vec<String>,
 }
 
 // ===== 管理指令：reload / log / posttoken =====
@@ -42,18 +43,29 @@ pub(super) async fn try_reload_config_command(
                     outcome.plugin_names.join(", ")
                 }
             );
+            let tool_summary = format!(
+                "plugin_tools({}): {}",
+                outcome.plugin_tool_names.len(),
+                if outcome.plugin_tool_names.is_empty() {
+                    "-".to_string()
+                } else {
+                    outcome.plugin_tool_names.join(", ")
+                }
+            );
             log_info(format!(
-                "config reloaded: provider={} model={} {}",
+                "config reloaded: provider={} model={} {} {}",
                 outcome.config.ai.provider.as_str(),
                 outcome.config.ai.model,
-                plugin_summary
+                plugin_summary,
+                tool_summary
             ));
 
             let mut msg = format!(
-                "配置已重载。provider={} model={} {}",
+                "配置已重载。provider={} model={} {} {}",
                 outcome.config.ai.provider.as_str(),
                 outcome.config.ai.model,
-                plugin_summary
+                plugin_summary,
+                tool_summary
             );
             if outcome.server_rebind_required {
                 msg.push_str(
@@ -393,6 +405,7 @@ async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
     let plugin_root = std::env::current_dir()?.join("Plugins");
     let plugins = PluginManager::load_from_dir(&plugin_root, new_config.clone())?;
     let plugin_names = plugins.plugin_names();
+    let plugin_tool_names = plugins.tool_names();
     let new_runtime = build_runtime(new_config.clone(), state.store.clone(), plugins)?;
 
     let mut runtime = state.runtime.write().await;
@@ -411,6 +424,7 @@ async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
         config: new_config,
         server_rebind_required,
         plugin_names,
+        plugin_tool_names,
     })
 }
 

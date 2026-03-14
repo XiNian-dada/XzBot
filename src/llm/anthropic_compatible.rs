@@ -12,6 +12,7 @@ use crate::{
         message_parts::{parse_user_content, ParsedUserContent},
         ocr::{ocr_images_to_text, OcrSettings},
     },
+    plugins::PluginManager,
     token_stats,
     tools::system::{get_process_info, get_system_info},
     tools::weather::get_weather,
@@ -33,6 +34,7 @@ pub struct AnthropicCompatibleLlm {
     debug: bool,
     search: SearchConfig,
     network: NetworkConfig,
+    plugins: PluginManager,
     vision_mode: VisionMode,
     ocr_settings: OcrSettings,
 }
@@ -44,6 +46,7 @@ impl AnthropicCompatibleLlm {
         search: &SearchConfig,
         network: &NetworkConfig,
         debug: bool,
+        plugins: PluginManager,
     ) -> Result<Self> {
         let base = config.base_url.trim_end_matches('/').to_string();
         let endpoint = if base.ends_with("/messages") {
@@ -66,6 +69,7 @@ impl AnthropicCompatibleLlm {
             debug,
             search: search.clone(),
             network: network.clone(),
+            plugins,
             vision_mode: config.vision_mode,
             ocr_settings: OcrSettings {
                 provider: config.ocr_provider,
@@ -142,7 +146,7 @@ impl AnthropicCompatibleLlm {
         system_text: String,
     ) -> Result<String> {
         const MAX_TOOL_ROUNDS: usize = 3;
-        let tools = anthropic_tools_schema();
+        let tools = anthropic_tools_schema(self.plugins.anthropic_tool_schemas());
 
         for round in 0..=MAX_TOOL_ROUNDS {
             let stage = if has_anthropic_tool_results(&messages) {
@@ -303,7 +307,7 @@ impl AnthropicCompatibleLlm {
         urls.truncate(2);
         let mut blocks = Vec::new();
         for url in urls {
-            match fetch_url(&self.client, &url, self.debug).await {
+            match fetch_url(&self.client, &url, self.debug, &self.network).await {
                 Ok(content) => blocks.push(content),
                 Err(err) => blocks.push(format!("URL: {url}\n抓取失败: {err}")),
             }
@@ -450,7 +454,7 @@ impl AnthropicCompatibleLlm {
                 if url.is_empty() {
                     return "fetch_url error: url is empty".to_string();
                 }
-                match fetch_url(&self.client, &url, self.debug).await {
+                match fetch_url(&self.client, &url, self.debug, &self.network).await {
                     Ok(v) => wrap_untrusted_tool_output("fetch_url", v),
                     Err(err) => format!("fetch_url error: {err}"),
                 }
@@ -491,7 +495,11 @@ impl AnthropicCompatibleLlm {
                     Err(err) => format!("get_weather error: {err}"),
                 }
             }
-            _ => format!("unknown tool: {}", call.name),
+            _ => match self.plugins.call_tool(&call.name, call.input.clone()).await {
+                Ok(Some(v)) => wrap_untrusted_tool_output(&call.name, v),
+                Ok(None) => format!("unknown tool: {}", call.name),
+                Err(err) => format!("{} error: {err}", call.name),
+            },
         }
     }
 }
@@ -629,9 +637,9 @@ struct ToolCall {
     input: Value,
 }
 
-fn anthropic_tools_schema() -> Value {
-    json!([
-        {
+fn anthropic_tools_schema(extra_tools: Vec<Value>) -> Value {
+    let mut tools = vec![
+        json!({
             "name": "search_web",
             "description": "Search the web for recent or external information.",
             "input_schema": {
@@ -641,8 +649,8 @@ fn anthropic_tools_schema() -> Value {
                 },
                 "required": ["query"]
             }
-        },
-        {
+        }),
+        json!({
             "name": "fetch_url",
             "description": "Fetch and read webpage content by URL.",
             "input_schema": {
@@ -652,8 +660,8 @@ fn anthropic_tools_schema() -> Value {
                 },
                 "required": ["url"]
             }
-        },
-        {
+        }),
+        json!({
             "name": "get_system_info",
             "description": "Read-only system information on this server. Supports full hardware/CPU/memory/disk/network status.",
             "input_schema": {
@@ -665,16 +673,16 @@ fn anthropic_tools_schema() -> Value {
                     }
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "get_process_info",
             "description": "Read-only process info for XzBot (memory/CPU/uptime/disk IO).",
             "input_schema": {
                 "type": "object",
                 "properties": {}
             }
-        },
-        {
+        }),
+        json!({
             "name": "get_weather",
             "description": "Get current weather by city/location name (current conditions only, not multi-day forecast).",
             "input_schema": {
@@ -687,8 +695,10 @@ fn anthropic_tools_schema() -> Value {
                 },
                 "required": ["location"]
             }
-        }
-    ])
+        }),
+    ];
+    tools.extend(extra_tools);
+    Value::Array(tools)
 }
 
 fn has_anthropic_tool_results(messages: &[Value]) -> bool {

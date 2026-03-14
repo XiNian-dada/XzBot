@@ -63,7 +63,7 @@ impl Llm for MockLlm {
 
         let mut extras = Vec::new();
         for url in urls.into_iter().take(1) {
-            match fetch_url(&self.client, &url, self.debug).await {
+            match fetch_url(&self.client, &url, self.debug, &self.network).await {
                 Ok(v) => extras.push(format!("[fetch_url]\n{v}")),
                 Err(err) => extras.push(format!("[fetch_url error] {err}")),
             }

@@ -24,7 +24,7 @@ impl OpenAiCompatibleLlm {
     ) -> Result<String> {
         const MAX_TOOL_ROUNDS: usize = 3;
         let mut ctx = self.build_responses_context(request_messages);
-        let tools = openai_responses_tools_schema();
+        let tools = openai_responses_tools_schema(self.plugins.openai_responses_tool_schemas());
         let mut executed_tool_signatures = HashSet::new();
 
         for round in 0..=MAX_TOOL_ROUNDS {

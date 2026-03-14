@@ -83,8 +83,22 @@ impl BotRouter {
             return Ok(Vec::new());
         }
 
-        let plugin_actions = self.plugins.try_handle(&event).await?;
-        if !plugin_actions.is_empty() {
+        let plugin_event = self.plugins.dispatch_event(&event).await?;
+        if plugin_event.stop_propagation {
+            log_debug(
+                self.config.debug,
+                format!(
+                    "plugin stopped propagation message_type={} user_id={} group_id={:?}",
+                    event.message_type, event.user_id, event.group_id
+                ),
+            );
+            return Ok(plugin_event.actions);
+        }
+
+        let mut plugin_actions = plugin_event.actions;
+        let command_actions = self.plugins.try_handle_command(&event).await?;
+        if !command_actions.is_empty() {
+            plugin_actions.extend(command_actions);
             log_debug(
                 self.config.debug,
                 format!(
@@ -114,12 +128,9 @@ impl BotRouter {
                 event.message_type, event.user_id, event.group_id
             ),
         );
-        Ok(self
-            .ai_chat
-            .handle_message(event)
-            .await?
-            .into_iter()
-            .collect())
+        let mut actions = plugin_actions;
+        actions.extend(self.ai_chat.handle_message(event).await?);
+        Ok(actions)
     }
 
     /// Gracefully shuts down all managed plugins.

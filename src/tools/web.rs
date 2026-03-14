@@ -14,9 +14,11 @@ use scraper::{Html, Selector};
 use serde_json::Value;
 use std::{
     collections::HashSet,
+    path::Path,
     sync::OnceLock,
     time::{Duration, Instant},
 };
+use tokio::{process::Command, time::timeout};
 
 const DEFAULT_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -27,6 +29,27 @@ use crate::config::{NetworkConfig, SearchConfig, SearchProvider};
 const MAX_FETCH_CHARS: usize = 5000;
 const MAX_SEARCH_PREVIEW_CHARS: usize = 700;
 const SEARCH_CACHE_TTL_SECS: u64 = 90;
+const BROWSER_FETCH_TIMEOUT_SECS: u64 = 15;
+
+/// 支持通过公开 API 读取的知乎页面类型。
+///
+/// 这里优先覆盖最常见、也是最值得抓取的三类：
+/// - 问题页
+/// - 单个回答页
+/// - 专栏文章页
+enum ZhihuApiTarget {
+    Question {
+        question_id: String,
+        answer_limit: usize,
+        answer_offset: usize,
+    },
+    Answer {
+        answer_id: String,
+    },
+    Article {
+        article_id: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 struct SearchHit {
@@ -59,8 +82,32 @@ pub async fn search_web(
     search::search_web(client, query, debug, search, network).await
 }
 
+fn is_zhihu_api_url(url: &str) -> bool {
+    let Some(parsed) = reqwest::Url::parse(url).ok() else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host != "www.zhihu.com" && host != "zhihu.com" {
+        return false;
+    };
+    let Some(mut segments) = parsed.path_segments() else {
+        return false;
+    };
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some("api"), Some("v4"), Some(_))
+    )
+}
+
 /// 抓取网页正文，并在必要时自动回退到 reader/proxy 方案。
-pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String> {
+pub async fn fetch_url(
+    client: &Client,
+    url: &str,
+    debug: bool,
+    network: &NetworkConfig,
+) -> Result<String> {
     let url = normalize_url_input(url);
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         bail!("invalid url (must start with http:// or https://): {url}");
@@ -68,6 +115,14 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
 
     if debug {
         println!("[DEBUG] tool.fetch_url url={url}");
+    }
+
+    // 知乎普通页面对静态抓取非常不友好，而且静态链路最终通常会退到 reader proxy。
+    // 这里直接短路到公开 API，避免把知乎内容再交给 r.jina.ai 一类代理。
+    if looks_like_zhihu_url(&url) || is_zhihu_api_url(&url) {
+        return fetch_zhihu_via_api(client, &url, debug, false)
+            .await
+            .with_context(|| format!("zhihu api fetch failed for url: {url}"));
     }
 
     // First pass: fetch with browser-like headers to reduce anti-bot/error stubs.
@@ -79,6 +134,9 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
                 println!("[DEBUG] fetch fallback to reader proxy url={url}");
             }
             // Fallback: use reader proxy to get rendered-readable text when direct fetch fails.
+            if let Ok(v) = fetch_via_headless_browser(&url, debug, network).await {
+                return Ok(v);
+            }
             if let Ok(v) = fetch_via_reader_proxy(client, &url, debug).await {
                 return Ok(v);
             }
@@ -100,6 +158,9 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
                 status, url, final_url
             );
             println!("[DEBUG] fetch fallback to reader proxy url={url}");
+        }
+        if let Ok(v) = fetch_via_headless_browser(&url, debug, network).await {
+            return Ok(v);
         }
         if let Ok(v) = fetch_via_reader_proxy(client, &url, debug).await {
             return Ok(v);
@@ -129,6 +190,9 @@ pub async fn fetch_url(client: &Client, url: &str, debug: bool) -> Result<String
                     "[DEBUG] fetch primary looks blocked/js-gated url={url} final={final_url}"
                 );
                 println!("[DEBUG] fetch fallback to reader proxy url={url}");
+            }
+            if let Ok(v) = fetch_via_headless_browser(&url, debug, network).await {
+                return Ok(v);
             }
             if let Ok(v) = fetch_via_reader_proxy(client, &url, debug).await {
                 return Ok(v);
@@ -172,6 +236,198 @@ async fn fetch_with_browser_profile(client: &Client, url: &str) -> Result<reqwes
         .send()
         .await
         .context("browser-profile request failed")
+}
+
+async fn fetch_via_headless_browser(
+    url: &str,
+    debug: bool,
+    network: &NetworkConfig,
+) -> Result<String> {
+    let lightpanda_err = match run_lightpanda_dump(url, debug, network).await {
+        Ok(v) => return Ok(v),
+        Err(err) => {
+            if debug {
+                println!(
+                    "[DEBUG] fetch.browser lightpanda failed url={} err={:#}",
+                    url, err
+                );
+            }
+            err
+        }
+    };
+
+    match run_chromium_dump(url, debug, network).await {
+        Ok(v) => Ok(v),
+        Err(err) => {
+            if debug {
+                println!(
+                    "[DEBUG] fetch.browser chromium failed url={} err={:#}",
+                    url, err
+                );
+            }
+            Err(err.context(format!("lightpanda failed earlier: {lightpanda_err:#}")))
+        }
+    }
+}
+
+async fn run_lightpanda_dump(url: &str, debug: bool, network: &NetworkConfig) -> Result<String> {
+    let output = run_browser_command(
+        "lightpanda",
+        &[
+            "fetch",
+            "--dump",
+            "--log_level",
+            "error",
+            "--http_timeout",
+            "10000",
+            url,
+        ],
+        debug,
+        network,
+    )
+    .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let html = browser_dump_to_html(&stdout);
+    let (title, text) = extract_html_text(&html)?;
+    let title = if title.trim().is_empty() {
+        "(no title)".to_string()
+    } else {
+        title
+    };
+    let text = truncate_text(&normalize_whitespace(&text), MAX_FETCH_CHARS);
+    if text.is_empty() || should_fallback_to_reader(&html, &text) {
+        bail!("lightpanda returned blocked/empty page");
+    }
+    Ok(format!(
+        "URL Requested: {url}\nURL Final: {url}\nFetch Mode: lightpanda\nTitle: {title}\nContent:\n{text}"
+    ))
+}
+
+async fn run_chromium_dump(url: &str, debug: bool, network: &NetworkConfig) -> Result<String> {
+    let args_base = [
+        "--headless",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--dump-dom",
+    ];
+    let proxy_arg = network
+        .proxy_enabled
+        .then(|| format!("--proxy-server={}", network.proxy_url.trim()));
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for binary in chromium_candidates() {
+        let mut args: Vec<String> = args_base.iter().map(|v| (*v).to_string()).collect();
+        if let Some(proxy) = &proxy_arg {
+            args.push(proxy.clone());
+        }
+        args.push(url.to_string());
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+
+        match run_browser_command(binary, &arg_refs, debug, network).await {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let html = browser_dump_to_html(&stdout);
+                let (title, text) = extract_html_text(&html)?;
+                let title = if title.trim().is_empty() {
+                    "(no title)".to_string()
+                } else {
+                    title
+                };
+                let text = truncate_text(&normalize_whitespace(&text), MAX_FETCH_CHARS);
+                if text.is_empty() || should_fallback_to_reader(&html, &text) {
+                    last_err = Some(anyhow!("browser returned blocked/empty page"));
+                    continue;
+                }
+                return Ok(format!(
+                    "URL Requested: {url}\nURL Final: {url}\nFetch Mode: chromium\nTitle: {title}\nContent:\n{text}"
+                ));
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("no chromium executable found")))
+}
+
+async fn run_browser_command(
+    binary: &str,
+    args: &[&str],
+    debug: bool,
+    network: &NetworkConfig,
+) -> Result<std::process::Output> {
+    let exists = Path::new(binary).is_absolute() && Path::new(binary).exists();
+    if Path::new(binary).is_absolute() && !exists {
+        bail!("browser executable not found: {binary}");
+    }
+
+    let mut cmd = Command::new(binary);
+    cmd.args(args);
+    apply_browser_proxy_env(&mut cmd, network);
+
+    if debug {
+        println!(
+            "[DEBUG] fetch.browser exec binary={} args={}",
+            binary,
+            args.join(" ")
+        );
+    }
+
+    let output = timeout(
+        Duration::from_secs(BROWSER_FETCH_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await
+    .context("browser command timeout")?
+    .with_context(|| format!("failed to run browser command: {binary}"))?;
+
+    if !output.status.success() {
+        let stderr = truncate_text(&String::from_utf8_lossy(&output.stderr), 300);
+        bail!(
+            "browser command failed status={} stderr={stderr}",
+            output.status
+        );
+    }
+
+    Ok(output)
+}
+
+fn apply_browser_proxy_env(cmd: &mut Command, network: &NetworkConfig) {
+    if !network.proxy_enabled {
+        return;
+    }
+    let proxy = network.proxy_url.trim();
+    if proxy.is_empty() {
+        return;
+    }
+    cmd.env("http_proxy", proxy)
+        .env("https_proxy", proxy)
+        .env("HTTP_PROXY", proxy)
+        .env("HTTPS_PROXY", proxy)
+        .env("ALL_PROXY", proxy)
+        .env("all_proxy", proxy);
+}
+
+fn chromium_candidates() -> &'static [&'static str] {
+    &[
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+}
+
+fn browser_dump_to_html(stdout: &str) -> String {
+    if let Some(idx) = stdout.find("<!DOCTYPE") {
+        return stdout[idx..].to_string();
+    }
+    if let Some(idx) = stdout.find("<html") {
+        return stdout[idx..].to_string();
+    }
+    stdout.to_string()
 }
 
 fn should_fallback_to_reader(body: &str, extracted_text: &str) -> bool {
@@ -287,6 +543,348 @@ fn build_reader_proxy_candidates(url: &str) -> Vec<String> {
         out.push(format!("https://r.jina.ai/{with_http}"));
     }
     out
+}
+
+fn looks_like_zhihu_url(url: &str) -> bool {
+    let Some(parsed) = reqwest::Url::parse(url).ok() else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    matches!(host, "www.zhihu.com" | "zhihu.com" | "zhuanlan.zhihu.com")
+}
+
+fn parse_zhihu_api_target(url: &str) -> Option<ZhihuApiTarget> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let segments: Vec<_> = parsed.path_segments()?.collect();
+    let answer_limit = query_usize(&parsed, "limit").unwrap_or(5);
+    let answer_offset = query_usize(&parsed, "offset").unwrap_or(0);
+
+    match host.as_str() {
+        "www.zhihu.com" | "zhihu.com" => match segments.as_slice() {
+            ["question", question_id] if !question_id.is_empty() => {
+                Some(ZhihuApiTarget::Question {
+                    question_id: (*question_id).to_string(),
+                    answer_limit,
+                    answer_offset,
+                })
+            }
+            ["api", "v4", "questions", question_id] if !question_id.is_empty() => {
+                Some(ZhihuApiTarget::Question {
+                    question_id: (*question_id).to_string(),
+                    answer_limit,
+                    answer_offset,
+                })
+            }
+            ["api", "v4", "questions", question_id, "answers"] if !question_id.is_empty() => {
+                Some(ZhihuApiTarget::Question {
+                    question_id: (*question_id).to_string(),
+                    answer_limit,
+                    answer_offset,
+                })
+            }
+            ["question", _, "answer", answer_id] if !answer_id.is_empty() => {
+                Some(ZhihuApiTarget::Answer {
+                    answer_id: (*answer_id).to_string(),
+                })
+            }
+            ["api", "v4", "answers", answer_id] if !answer_id.is_empty() => {
+                Some(ZhihuApiTarget::Answer {
+                    answer_id: (*answer_id).to_string(),
+                })
+            }
+            ["api", "v4", "articles", article_id] if !article_id.is_empty() => {
+                Some(ZhihuApiTarget::Article {
+                    article_id: (*article_id).to_string(),
+                })
+            }
+            _ => None,
+        },
+        "zhuanlan.zhihu.com" => match segments.as_slice() {
+            ["p", article_id] if !article_id.is_empty() => Some(ZhihuApiTarget::Article {
+                article_id: (*article_id).to_string(),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+async fn fetch_zhihu_via_api(
+    client: &Client,
+    url: &str,
+    debug: bool,
+    preview_mode: bool,
+) -> Result<String> {
+    let target = parse_zhihu_api_target(url)
+        .ok_or_else(|| anyhow!("unsupported zhihu url for api mode: {url}"))?;
+
+    if debug {
+        println!(
+            "[DEBUG] fetch.zhihu_api mode={} url={}",
+            if preview_mode { "preview" } else { "full" },
+            url
+        );
+    }
+
+    match target {
+        ZhihuApiTarget::Question {
+            question_id,
+            answer_limit,
+            answer_offset,
+        } => {
+            fetch_zhihu_question(
+                client,
+                url,
+                debug,
+                &question_id,
+                answer_limit,
+                answer_offset,
+                preview_mode,
+            )
+            .await
+        }
+        ZhihuApiTarget::Answer { answer_id } => {
+            fetch_zhihu_answer(client, url, debug, &answer_id, preview_mode).await
+        }
+        ZhihuApiTarget::Article { article_id } => {
+            fetch_zhihu_article(client, url, debug, &article_id, preview_mode).await
+        }
+    }
+}
+
+async fn fetch_zhihu_question(
+    client: &Client,
+    url: &str,
+    debug: bool,
+    question_id: &str,
+    answer_limit: usize,
+    answer_offset: usize,
+    preview_mode: bool,
+) -> Result<String> {
+    let answers_limit = if preview_mode {
+        answer_limit.min(2).max(1)
+    } else {
+        answer_limit.max(1)
+    };
+    let answers_api = format!(
+        "https://www.zhihu.com/api/v4/questions/{question_id}/answers?limit={answers_limit}&offset={answer_offset}&include=data[*].content,voteup_count,comment_count,created_time,updated_time,excerpt"
+    );
+    if debug {
+        println!("[DEBUG] fetch.zhihu_api answers_api={answers_api}");
+    }
+    let answers = fetch_json_value(client, &answers_api).await?;
+    let answers_array = answers
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("zhihu question api missing data array"))?;
+    let paging = answers.get("paging").cloned().unwrap_or(Value::Null);
+    let total_answers = paging
+        .get("totals")
+        .and_then(Value::as_i64)
+        .unwrap_or(answers_array.len() as i64);
+    let title = answers_array
+        .first()
+        .and_then(|answer| answer.get("question"))
+        .and_then(|question| question.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("(无标题)");
+
+    let mut out = format!(
+        "URL Requested: {url}\nURL Final: {answers_api}\nFetch Mode: zhihu_api\nZhihu Type: question\nQuestion Title: {title}\nAnswer Count: {total_answers}\n"
+    );
+
+    if answers_array.is_empty() {
+        out.push_str("Answers: (none)");
+        return Ok(out);
+    }
+
+    out.push_str("Answers:\n");
+    for (idx, answer) in answers_array.iter().enumerate() {
+        let author = answer
+            .get("author")
+            .and_then(|v| v.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("匿名用户");
+        let votes = answer
+            .get("voteup_count")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let comments = answer
+            .get("comment_count")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let content = answer
+            .get("content")
+            .and_then(Value::as_str)
+            .map(html_fragment_to_text)
+            .or_else(|| {
+                answer
+                    .get("excerpt")
+                    .and_then(Value::as_str)
+                    .map(html_fragment_to_text)
+            })
+            .unwrap_or_default();
+        let content = truncate_text(&content, if preview_mode { 220 } else { 900 });
+        out.push_str(&format!(
+            "{}. Author: {} | Votes: {} | Comments: {}\n{}\n",
+            idx + 1,
+            author,
+            votes,
+            comments,
+            content
+        ));
+    }
+
+    Ok(out)
+}
+
+async fn fetch_zhihu_answer(
+    client: &Client,
+    url: &str,
+    debug: bool,
+    answer_id: &str,
+    preview_mode: bool,
+) -> Result<String> {
+    let answer_api = format!(
+        "https://www.zhihu.com/api/v4/answers/{answer_id}?include=content,voteup_count,comment_count,created_time,updated_time,excerpt,author.name,question.title"
+    );
+    if debug {
+        println!("[DEBUG] fetch.zhihu_api answer_api={answer_api}");
+    }
+    let answer = fetch_json_value(client, &answer_api).await?;
+
+    let question_title = answer
+        .get("question")
+        .and_then(|v| v.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("(无标题)");
+    let author = answer
+        .get("author")
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("匿名用户");
+    let votes = answer
+        .get("voteup_count")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let comments = answer
+        .get("comment_count")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let content = answer
+        .get("content")
+        .and_then(Value::as_str)
+        .map(html_fragment_to_text)
+        .or_else(|| {
+            answer
+                .get("excerpt")
+                .and_then(Value::as_str)
+                .map(html_fragment_to_text)
+        })
+        .unwrap_or_default();
+    let content = truncate_text(
+        &content,
+        if preview_mode {
+            MAX_SEARCH_PREVIEW_CHARS
+        } else {
+            MAX_FETCH_CHARS
+        },
+    );
+
+    Ok(format!(
+        "URL Requested: {url}\nURL Final: {answer_api}\nFetch Mode: zhihu_api\nZhihu Type: answer\nQuestion Title: {question_title}\nAuthor: {author}\nVotes: {votes}\nComments: {comments}\nContent:\n{content}"
+    ))
+}
+
+async fn fetch_zhihu_article(
+    client: &Client,
+    url: &str,
+    debug: bool,
+    article_id: &str,
+    preview_mode: bool,
+) -> Result<String> {
+    let article_api = format!(
+        "https://www.zhihu.com/api/v4/articles/{article_id}?include=title,excerpt,content,voteup_count,comment_count"
+    );
+    if debug {
+        println!("[DEBUG] fetch.zhihu_api article_api={article_api}");
+    }
+    let article = fetch_json_value(client, &article_api).await?;
+    let title = json_str(&article, "title").unwrap_or("(无标题)");
+    let votes = article
+        .get("voteup_count")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let comments = article
+        .get("comment_count")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let content = article
+        .get("content")
+        .and_then(Value::as_str)
+        .map(html_fragment_to_text)
+        .or_else(|| {
+            article
+                .get("excerpt")
+                .and_then(Value::as_str)
+                .map(html_fragment_to_text)
+        })
+        .unwrap_or_default();
+    let content = truncate_text(
+        &content,
+        if preview_mode {
+            MAX_SEARCH_PREVIEW_CHARS
+        } else {
+            MAX_FETCH_CHARS
+        },
+    );
+
+    Ok(format!(
+        "URL Requested: {url}\nURL Final: {article_api}\nFetch Mode: zhihu_api\nZhihu Type: article\nTitle: {title}\nVotes: {votes}\nComments: {comments}\nContent:\n{content}"
+    ))
+}
+
+async fn fetch_json_value(client: &Client, url: &str) -> Result<Value> {
+    let response = client
+        .get(url)
+        .header("User-Agent", DEFAULT_UA)
+        .header("Accept", "application/json,text/plain,*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+        .header("Referer", "https://www.zhihu.com/")
+        .send()
+        .await
+        .with_context(|| format!("zhihu api request failed: {url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read zhihu api body")?;
+    if !status.is_success() {
+        let brief = truncate_text(&normalize_whitespace(&body), 240);
+        bail!("zhihu api returned {status}: {brief}");
+    }
+    serde_json::from_str(&body).context("failed to parse zhihu api json")
+}
+
+fn json_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn query_usize(url: &reqwest::Url, key: &str) -> Option<usize> {
+    url.query_pairs()
+        .find_map(|(k, v)| (k == key).then(|| v.parse::<usize>().ok()).flatten())
+}
+
+fn html_fragment_to_text(html: &str) -> String {
+    if !html.contains('<') {
+        return normalize_whitespace(html);
+    }
+    let fragment = Html::parse_fragment(html);
+    let text = fragment.root_element().text().collect::<Vec<_>>().join(" ");
+    normalize_whitespace(&text)
 }
 
 fn reader_http_style_url(url: &str) -> Option<String> {

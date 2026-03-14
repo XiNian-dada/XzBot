@@ -41,7 +41,7 @@ pub(super) async fn search_web(
     }
 
     if search.provider == SearchProvider::Searxng {
-        return search_web_searxng(client, query, debug, search, &cache_key).await;
+        return search_web_searxng(client, query, debug, search, network, &cache_key).await;
     }
 
     let search_client = match build_search_session_client(network) {
@@ -322,7 +322,7 @@ pub(super) async fn search_web(
             break;
         }
 
-        match fetch_search_preview(client, &hit.url).await {
+        match fetch_search_preview(client, &hit.url, network).await {
             Ok(preview) => {
                 if preview_count == 0 {
                     out.push_str("\n网页核验预览（自动抓取）:\n");
@@ -451,6 +451,7 @@ async fn search_web_searxng(
     query: &str,
     debug: bool,
     search: &SearchConfig,
+    network: &NetworkConfig,
     cache_key: &str,
 ) -> Result<String> {
     let normalized = normalize_search_query(query);
@@ -512,7 +513,7 @@ async fn search_web_searxng(
             .find(|hit| is_preferred_weather_domain_url(&hit.url))
             .or_else(|| top_hits.first());
         if let Some(target) = preview_target {
-            match fetch_search_preview(client, &target.url).await {
+            match fetch_search_preview(client, &target.url, network).await {
                 Ok(preview) => {
                     out.push_str("\n天气网页核验预览（自动抓取，优先天气站）:\n");
                     out.push_str(&format!(
@@ -1030,10 +1031,21 @@ async fn search_duckduckgo_api(client: &Client, query: &str) -> Result<Vec<Searc
     Ok(out)
 }
 
-async fn fetch_search_preview(client: &Client, url: &str) -> Result<String> {
+async fn fetch_search_preview(
+    client: &Client,
+    url: &str,
+    network: &NetworkConfig,
+) -> Result<String> {
     let url = normalize_url_input(url);
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         bail!("invalid preview url: {url}");
+    }
+
+    // 知乎搜索结果优先走公开 API，避免正文预览阶段被 403 / JS 壳页面拦住。
+    if looks_like_zhihu_url(&url) {
+        return fetch_zhihu_via_api(client, &url, false, true)
+            .await
+            .with_context(|| format!("zhihu preview fetch failed: {url}"));
     }
 
     let response = client
@@ -1051,6 +1063,9 @@ async fn fetch_search_preview(client: &Client, url: &str) -> Result<String> {
         .context("failed to read preview body")?;
 
     if !status.is_success() {
+        if let Ok(v) = fetch_via_headless_browser(&url, false, network).await {
+            return Ok(v);
+        }
         let brief = truncate_text(&normalize_whitespace(&body), 220);
         bail!("preview returned {status}: {brief}");
     }
@@ -1070,6 +1085,11 @@ async fn fetch_search_preview(client: &Client, url: &str) -> Result<String> {
             title
         };
         let text = truncate_text(&normalize_whitespace(&text), MAX_SEARCH_PREVIEW_CHARS);
+        if should_fallback_to_reader(&body, &text) {
+            if let Ok(v) = fetch_via_headless_browser(&url, false, network).await {
+                return Ok(v);
+            }
+        }
         return Ok(format!(
             "URL Final: {final_url}\n{redirect}Title: {title}\nContent: {text}"
         ));

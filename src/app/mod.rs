@@ -175,8 +175,27 @@ pub async fn run() -> anyhow::Result<()> {
     let ws_action_tx = Arc::new(RwLock::new(None));
     let plugin_root = std::env::current_dir()?.join("Plugins");
     let plugins = PluginManager::load_from_dir(&plugin_root, config.clone())?;
+    let plugin_names = plugins.plugin_names();
+    let plugin_tool_names = plugins.tool_names();
     log_info(format!("Plugins dir: {}", plugin_root.display()));
-    log_info(format!("Loaded plugins: {}", plugins.plugin_count()));
+    log_info(format!(
+        "Loaded plugins({}): {}",
+        plugins.plugin_count(),
+        if plugin_names.is_empty() {
+            "-".to_string()
+        } else {
+            plugin_names.join(", ")
+        }
+    ));
+    log_info(format!(
+        "Loaded plugin tools({}): {}",
+        plugin_tool_names.len(),
+        if plugin_tool_names.is_empty() {
+            "-".to_string()
+        } else {
+            plugin_tool_names.join(", ")
+        }
+    ));
 
     let runtime = Arc::new(RwLock::new(build_runtime(
         config.clone(),
@@ -216,7 +235,7 @@ fn build_runtime(
     store: Arc<MemoryStore>,
     plugins: PluginManager,
 ) -> anyhow::Result<RuntimeState> {
-    let llm = build_llm_chain(&config)?;
+    let llm = build_llm_chain(&config, plugins.clone())?;
     let ai_chat = AiChatPlugin::new(store, llm, config.clone());
     let router = Arc::new(BotRouter::new(ai_chat, plugins, config.clone()));
 
@@ -229,7 +248,7 @@ fn build_runtime(
 /// - `ai.model` 作为主模型
 /// - `ai.fallback_models` 依次作为候补
 /// - 所有候选共享同一套 provider/base_url/api_key 等参数
-fn build_llm_chain(config: &Arc<Config>) -> anyhow::Result<Arc<dyn Llm>> {
+fn build_llm_chain(config: &Arc<Config>, plugins: PluginManager) -> anyhow::Result<Arc<dyn Llm>> {
     let mut candidates = Vec::new();
 
     for model in config.ai.model_chain() {
@@ -249,12 +268,14 @@ fn build_llm_chain(config: &Arc<Config>) -> anyhow::Result<Arc<dyn Llm>> {
                 &config.network,
                 config.debug,
                 false,
+                plugins.clone(),
             )?),
             AiProvider::AnthropicCompatible => Arc::new(AnthropicCompatibleLlm::from_config(
                 &ai_config,
                 &config.search,
                 &config.network,
                 config.debug,
+                plugins.clone(),
             )?),
         };
 

@@ -1086,9 +1086,9 @@ pub(super) fn build_responses_function_call_output_item(call_id: &str, output: &
     })
 }
 
-pub(super) fn openai_tools_schema() -> Value {
-    json!([
-        {
+pub(super) fn openai_tools_schema(extra_tools: Vec<Value>) -> Value {
+    let mut tools = vec![
+        json!({
             "type": "function",
             "function": {
                 "name": "search_web",
@@ -1101,8 +1101,8 @@ pub(super) fn openai_tools_schema() -> Value {
                     "required": ["query"]
                 }
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "function": {
                 "name": "fetch_url",
@@ -1115,8 +1115,8 @@ pub(super) fn openai_tools_schema() -> Value {
                     "required": ["url"]
                 }
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "function": {
                 "name": "get_system_info",
@@ -1128,16 +1128,16 @@ pub(super) fn openai_tools_schema() -> Value {
                     }
                 }
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "function": {
                 "name": "get_process_info",
                 "description": "Read-only process info for XzBot (memory/CPU/uptime/disk IO).",
                 "parameters": { "type": "object", "properties": {} }
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "function": {
                 "name": "get_weather",
@@ -1150,13 +1150,15 @@ pub(super) fn openai_tools_schema() -> Value {
                     "required": ["location"]
                 }
             }
-        }
-    ])
+        }),
+    ];
+    tools.extend(extra_tools);
+    Value::Array(tools)
 }
 
-pub(super) fn openai_responses_tools_schema() -> Value {
-    json!([
-        {
+pub(super) fn openai_responses_tools_schema(extra_tools: Vec<Value>) -> Value {
+    let mut tools = vec![
+        json!({
             "type": "function",
             "name": "search_web",
             "description": "Search the web for recent or external information.",
@@ -1167,8 +1169,8 @@ pub(super) fn openai_responses_tools_schema() -> Value {
                 },
                 "required": ["query"]
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "fetch_url",
             "description": "Fetch and read webpage content by URL.",
@@ -1179,8 +1181,8 @@ pub(super) fn openai_responses_tools_schema() -> Value {
                 },
                 "required": ["url"]
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "get_system_info",
             "description": "Read-only system information on this server. Supports full hardware/CPU/memory/disk/network status.",
@@ -1190,14 +1192,14 @@ pub(super) fn openai_responses_tools_schema() -> Value {
                     "scope": { "type": "string", "description": "summary/hardware/cpu/memory/disk/network/load/uptime/all" }
                 }
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "get_process_info",
             "description": "Read-only process info for XzBot (memory/CPU/uptime/disk IO).",
             "parameters": { "type": "object", "properties": {} }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "get_weather",
             "description": "Get current weather by city/location name (current conditions only, not multi-day forecast).",
@@ -1208,8 +1210,10 @@ pub(super) fn openai_responses_tools_schema() -> Value {
                 },
                 "required": ["location"]
             }
-        }
-    ])
+        }),
+    ];
+    tools.extend(extra_tools);
+    Value::Array(tools)
 }
 
 pub(super) fn prepend_runtime_system_hint(messages: &mut Vec<Value>) {

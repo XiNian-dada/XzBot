@@ -23,6 +23,7 @@ use crate::{
         ocr::{ocr_images_to_text, OcrSettings},
     },
     logger::warn_err as log_warn_err,
+    plugins::PluginManager,
     token_stats,
     tools::system::{get_process_info, get_system_info},
     tools::weather::get_weather,
@@ -60,6 +61,7 @@ pub struct OpenAiCompatibleLlm {
     suppress_transient_errors: bool,
     search: SearchConfig,
     network: NetworkConfig,
+    plugins: PluginManager,
     vision_mode: VisionMode,
     ocr_settings: OcrSettings,
 }
@@ -129,6 +131,7 @@ impl OpenAiCompatibleLlm {
         network: &NetworkConfig,
         debug: bool,
         suppress_transient_errors: bool,
+        plugins: PluginManager,
     ) -> Result<Self> {
         let base = config.base_url.trim_end_matches('/').to_string();
         let endpoint = resolve_openai_endpoint(&base, config.wire_api);
@@ -151,6 +154,7 @@ impl OpenAiCompatibleLlm {
             suppress_transient_errors,
             search: search.clone(),
             network: network.clone(),
+            plugins,
             vision_mode: config.vision_mode,
             ocr_settings: OcrSettings {
                 provider: config.ocr_provider,
@@ -289,7 +293,7 @@ impl OpenAiCompatibleLlm {
         mut messages: Vec<Value>,
     ) -> Result<String> {
         const MAX_TOOL_ROUNDS: usize = 3;
-        let tools = openai_tools_schema();
+        let tools = openai_tools_schema(self.plugins.openai_chat_tool_schemas());
         let mut executed_tool_signatures = HashSet::new();
 
         for round in 0..=MAX_TOOL_ROUNDS {
@@ -986,7 +990,7 @@ impl OpenAiCompatibleLlm {
         urls.truncate(2);
         let mut blocks = Vec::new();
         for url in urls {
-            match fetch_url(&self.client, &url, self.debug).await {
+            match fetch_url(&self.client, &url, self.debug, &self.network).await {
                 Ok(content) => blocks.push(content),
                 Err(err) => blocks.push(format!("URL: {url}\n抓取失败: {err}")),
             }
@@ -1180,7 +1184,7 @@ impl OpenAiCompatibleLlm {
                 if url.is_empty() {
                     return "fetch_url error: url is empty".to_string();
                 }
-                match fetch_url(&self.client, &url, self.debug).await {
+                match fetch_url(&self.client, &url, self.debug, &self.network).await {
                     Ok(v) => wrap_untrusted_tool_output("fetch_url", v),
                     Err(err) => format!("fetch_url error: {err}"),
                 }
@@ -1211,7 +1215,15 @@ impl OpenAiCompatibleLlm {
                     Err(err) => format!("get_weather error: {err}"),
                 }
             }
-            _ => format!("unknown tool: {}", call.name),
+            _ => match self
+                .plugins
+                .call_tool(&call.name, call.arguments.clone())
+                .await
+            {
+                Ok(Some(v)) => wrap_untrusted_tool_output(&call.name, v),
+                Ok(None) => format!("unknown tool: {}", call.name),
+                Err(err) => format!("{} error: {err}", call.name),
+            },
         }
     }
 }

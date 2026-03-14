@@ -12,7 +12,7 @@
 - **OCR 兜底** — 非多模态模型自动 OCR（Tesseract / PaddleOCR）
 - **Function Call 工具**
   - `search_web` — 网页搜索
-  - `fetch_url` — 抓取 URL 内容（浏览器风格请求 + 失败时 reader 兜底）
+  - `fetch_url` — 抓取 URL 内容（知乎优先走公开 API，其他站点走浏览器风格请求 + reader 兜底）
   - `get_system_info` — 只读系统信息
   - `get_process_info` — 只读 XzBot 进程资源占用
   - `get_weather` — 天气查询（当前天气，作为兜底）
@@ -231,11 +231,40 @@ fallback_models = ["gpt-4.1", "gpt-4o-mini"]
 
 ### URL 抓取策略
 
-`fetch_url` 采用两段式：
-1. 浏览器风格请求（完整请求头）
-2. 若失败/命中 JS 门页/反爬页，自动回退 `reader proxy` 抓取正文
+`fetch_url` 采用分层抓取：
+1. 若识别为知乎问题/回答/专栏链接，优先构造知乎公开 API 地址并直接读取 JSON
+2. 其他站点走浏览器风格请求（完整请求头）
+3. 若失败或命中 JS 门页 / 反爬页，优先尝试无头浏览器抓取：
+   - 首选 `lightpanda`
+   - 回退 `chromium` / `google-chrome`
+4. 仍失败时，最后回退 `reader proxy` 抓取正文
 
-这样在动态站点和反爬站点上稳定性更高。
+知乎这样处理的原因很直接：普通静态抓取对知乎问题页非常容易命中 403 或 JS 壳页面，
+而公开 API 对问题、回答、专栏内容更稳定，也更适合模型读取。
+
+无头浏览器链路的目标不是替代所有普通请求，而是专门处理：
+- 强依赖 JS 渲染的页面
+- 只返回占位壳页面的站点
+- 普通 HTTP 抓取明显不可靠的页面
+
+其中：
+- `lightpanda` 作为轻量高性能浏览器优先尝试
+- `chromium` 作为兼容性兜底
+
+支持的知乎页面类型：
+- `https://www.zhihu.com/question/<id>`
+- `https://www.zhihu.com/question/<id>/answer/<id>`
+- `https://zhuanlan.zhihu.com/p/<id>`
+- `https://www.zhihu.com/api/v4/questions/<id>/answers?...`
+- `https://www.zhihu.com/api/v4/answers/<id>...`
+- `https://www.zhihu.com/api/v4/articles/<id>...`
+
+如果用户直接给的是知乎 API 链接，XzBot 会优先保留其中的 `limit` / `offset`，
+并自动补齐适合正文抓取的 `include` 字段，避免因为字段不全只拿到“空壳 JSON”。
+
+原来的通用链路仍保留，所以知乎 API 临时不可用时，会继续退回普通抓取。
+
+这样在动态站点、反爬站点和知乎这类高门槛页面上稳定性更高。
 
 ```toml
 [network]
@@ -311,11 +340,43 @@ Plugins/
 并输出 JSON 清单：
 
 ```json
-{ "name": "my-plugin", "commands": ["hello"], "timeout_ms": 20000 }
+{
+  "name": "my-plugin",
+  "commands": ["hello"],
+  "subscriptions": ["mention", "image"],
+  "tools": [
+    {
+      "name": "repo_analyze",
+      "description": "分析 GitHub 仓库并返回摘要",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "repo": { "type": "string" }
+        },
+        "required": ["repo"]
+      }
+    }
+  ],
+  "timeout_ms": 20000,
+  "priority": 100
+}
 ```
 
+现在的插件既可以做命令型扩展，也可以订阅事件，或向 AI 注册新工具：
+
+- `commands`：处理 `/hello`
+- `subscriptions`：监听 `group_message` / `mention` / `image` / `quote` 等事件
+- `tools`：向 AI 暴露新的 function call
+
 通信方式：stdin/stdout 按行 JSON（必须回传 `request_id`）。
-插件可返回 `file_path` 以发送文件（适合长报告），也可返回 `image_path` / `image_url` 发送图片（CQ 码）。
+插件新版推荐返回 `actions` 数组，支持按顺序发送：
+
+- `message`
+- `image`
+- `file`
+
+也支持 `stop_propagation=true` 阻断后续 AI/插件处理。
+旧版 `reply` / `file_path` / `image_path` 协议仍兼容。
 `/reload` 可重新扫描 `Plugins/` 并重启插件进程。
 插件 stderr 会转发到 XzBot 控制台日志。
 
