@@ -1001,6 +1001,24 @@ pub(super) fn convert_chat_message_to_responses_item(
     }
 
     let parts = content.as_array()?;
+    let has_images = parts.iter().any(|part| {
+        matches!(
+            part.get("type").and_then(Value::as_str),
+            Some("image_url" | "input_image")
+        )
+    });
+
+    // 很多“OpenAI Responses 兼容网关”对输入 message 的 content 数组支持并不完整，
+    // 尤其会拒绝 `input_text` 这类标准类型。对纯文本消息，优先退化为简单字符串，
+    // 兼容性明显更高；只有确实携带图片时，才保留结构化 content 数组。
+    if !has_images {
+        let text = message_content_as_text(message);
+        if text.trim().is_empty() {
+            return None;
+        }
+        return Some(build_responses_text_message(role, text));
+    }
+
     let mut out_parts = Vec::new();
     for part in parts {
         let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
@@ -1062,10 +1080,7 @@ pub(super) fn build_responses_text_message(role: &str, text: impl Into<String>) 
     let text = text.into();
     json!({
         "role": role,
-        "content": [{
-            "type": "input_text",
-            "text": text
-        }]
+        "content": text
     })
 }
 

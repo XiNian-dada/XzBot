@@ -51,17 +51,19 @@ impl MemoryStore {
         self.sessions.remove(key);
     }
 
-    /// Returns a snapshot of current conversation messages for one session.
-    pub fn messages(&self, key: &SessionKey) -> Vec<(String, String)> {
-        self.sessions
-            .get(key)
-            .map(|v| v.clone())
-            .unwrap_or_default()
-    }
-
-    /// Appends one user message and trims old history if needed.
-    pub fn push_user_message(&self, key: SessionKey, content: String) {
-        self.push_message(key, "user", content);
+    /// Appends one user message and returns the updated history snapshot.
+    ///
+    /// AI 主链路里最常见的模式是：
+    /// 1. 先把用户消息写入上下文
+    /// 2. 立刻读取完整历史去调用模型
+    ///
+    /// 单独 `push` 再 `get` 会多做一次 `DashMap` 查找，因此这里提供一个组合接口。
+    pub fn push_user_message_and_snapshot(
+        &self,
+        key: SessionKey,
+        content: String,
+    ) -> Vec<(String, String)> {
+        self.push_message_and_snapshot(key, "user", content)
     }
 
     /// Appends one assistant message and trims old history if needed.
@@ -78,5 +80,23 @@ impl MemoryStore {
             let overflow = entry.len() - 20;
             entry.drain(0..overflow);
         }
+    }
+
+    /// Internal append helper that also clones the updated snapshot for immediate reuse.
+    fn push_message_and_snapshot(
+        &self,
+        key: SessionKey,
+        role: &str,
+        content: String,
+    ) -> Vec<(String, String)> {
+        let mut entry = self.sessions.entry(key).or_insert_with(Vec::new);
+        entry.push((role.to_string(), content));
+
+        if entry.len() > 20 {
+            let overflow = entry.len() - 20;
+            entry.drain(0..overflow);
+        }
+
+        entry.clone()
     }
 }

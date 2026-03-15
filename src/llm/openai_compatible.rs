@@ -16,12 +16,12 @@ use serde_json::{json, Value};
 
 use crate::{
     config::{AiConfig, NetworkConfig, OpenAiWireApi, SearchConfig, VisionMode},
-    llm::Llm,
     llm::{
         image::load_image_for_llm,
         message_parts::{parse_user_content, ParsedUserContent},
         ocr::{ocr_images_to_text, OcrSettings},
     },
+    llm::{tool_error_with_hint, Llm},
     logger::warn_err as log_warn_err,
     plugins::PluginManager,
     token_stats,
@@ -282,6 +282,28 @@ impl Llm for OpenAiCompatibleLlm {
         };
 
         Ok(sanitize_identity_preface(&reply))
+    }
+
+    /// Generates one short progress acknowledgement without tools.
+    async fn progress_ack(
+        &self,
+        session_id: String,
+        messages: Vec<(String, String)>,
+    ) -> anyhow::Result<Option<String>> {
+        let request_messages: Vec<Value> = messages
+            .into_iter()
+            .map(|(role, content)| json!({ "role": role, "content": content }))
+            .collect();
+
+        let reply = match self.wire_api {
+            OpenAiWireApi::ChatCompletions => self.chat_plain(session_id, request_messages).await?,
+            OpenAiWireApi::Responses => {
+                self.chat_plain_responses(session_id, request_messages)
+                    .await?
+            }
+        };
+
+        Ok(Some(sanitize_identity_preface(&reply)))
     }
 }
 
@@ -1125,7 +1147,11 @@ impl OpenAiCompatibleLlm {
                     .unwrap_or_default();
                 let query = strip_sender_prefix(query.trim()).trim().to_string();
                 if query.is_empty() {
-                    return "search_web error: query is empty".to_string();
+                    return tool_error_with_hint(
+                        "search_web",
+                        "query is empty",
+                        "提供更具体的关键词；如果用户已经给了网页链接，改用 fetch_url。",
+                    );
                 }
                 // Weather policy: search web first for multi-day forecast; use get_weather only as fallback.
                 let weather_query = weather_intent_from_text(&query.to_lowercase());
@@ -1167,7 +1193,11 @@ impl OpenAiCompatibleLlm {
                                 );
                             }
                         }
-                        format!("search_web error: {err}")
+                        tool_error_with_hint(
+                            "search_web",
+                            err,
+                            "如果这是网页内容问题，可改用 fetch_url；如果搜索词太泛，请先缩小关键词范围。",
+                        )
                     }
                 }
             }
@@ -1182,11 +1212,19 @@ impl OpenAiCompatibleLlm {
                     .unwrap_or_default();
                 let url = url.trim().to_string();
                 if url.is_empty() {
-                    return "fetch_url error: url is empty".to_string();
+                    return tool_error_with_hint(
+                        "fetch_url",
+                        "url is empty",
+                        "直接提供一个完整链接；如果现在只有主题没有链接，先用 search_web。",
+                    );
                 }
                 match fetch_url(&self.client, &url, self.debug, &self.network).await {
                     Ok(v) => wrap_untrusted_tool_output("fetch_url", v),
-                    Err(err) => format!("fetch_url error: {err}"),
+                    Err(err) => tool_error_with_hint(
+                        "fetch_url",
+                        err,
+                        "如果页面抓取失败或被拦截，可改用 search_web 先找摘要、镜像或相关新闻页面。",
+                    ),
                 }
             }
             "get_system_info" => {
@@ -1208,11 +1246,19 @@ impl OpenAiCompatibleLlm {
                         .unwrap_or_default();
                 let location = strip_sender_prefix(location.trim()).trim().to_string();
                 if location.is_empty() {
-                    return "get_weather error: location is empty".to_string();
+                    return tool_error_with_hint(
+                        "get_weather",
+                        "location is empty",
+                        "提供更具体的地点；如果需要未来多天预报，优先改用 search_web。",
+                    );
                 }
                 match get_weather(&self.client, &location, self.debug).await {
                     Ok(v) => wrap_untrusted_tool_output("get_weather", v),
-                    Err(err) => format!("get_weather error: {err}"),
+                    Err(err) => tool_error_with_hint(
+                        "get_weather",
+                        err,
+                        "如果当前天气接口不稳定，可改用 search_web 搜索该地点的天气预报页面。",
+                    ),
                 }
             }
             _ => match self
@@ -1222,7 +1268,11 @@ impl OpenAiCompatibleLlm {
             {
                 Ok(Some(v)) => wrap_untrusted_tool_output(&call.name, v),
                 Ok(None) => format!("unknown tool: {}", call.name),
-                Err(err) => format!("{} error: {err}", call.name),
+                Err(err) => tool_error_with_hint(
+                    &call.name,
+                    err,
+                    "检查参数是否完整，或换用别的内置工具/插件工具。",
+                ),
             },
         }
     }

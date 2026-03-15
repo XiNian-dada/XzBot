@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Error};
 use async_trait::async_trait;
+use std::fmt::Display;
 use std::sync::Arc;
 
 use crate::logger::{warn as log_warn, warn_err as log_warn_err};
@@ -28,6 +29,18 @@ pub trait Llm: Send + Sync {
         session_id: String,
         messages: Vec<(String, String)>,
     ) -> anyhow::Result<String>;
+
+    /// Generates one short progress acknowledgement for slow tasks.
+    ///
+    /// 这条回复只用于“先说一句我正在处理”，不应包含最终结论，也不应触发工具。
+    /// 默认实现返回 `None`，表示当前后端不提供这项能力。
+    async fn progress_ack(
+        &self,
+        _session_id: String,
+        _messages: Vec<(String, String)>,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// 多模型回退包装器。
@@ -122,11 +135,70 @@ impl Llm for FallbackLlm {
 
         Err(last_err.unwrap_or_else(|| anyhow!("no LLM candidates configured")))
     }
+
+    async fn progress_ack(
+        &self,
+        session_id: String,
+        messages: Vec<(String, String)>,
+    ) -> anyhow::Result<Option<String>> {
+        let mut last_err: Option<Error> = None;
+
+        for (idx, candidate) in self.candidates.iter().enumerate() {
+            if self.debug && self.candidates.len() > 1 {
+                println!(
+                    "[DEBUG] llm progress-ack attempt {}/{} model={}",
+                    idx + 1,
+                    self.candidates.len(),
+                    candidate.label
+                );
+            }
+
+            match candidate
+                .llm
+                .progress_ack(session_id.clone(), messages.clone())
+                .await
+            {
+                Ok(Some(reply)) => return Ok(Some(reply)),
+                Ok(None) => continue,
+                Err(err) => {
+                    if self.candidates.len() > 1 {
+                        log_warn_err(
+                            format!(
+                                "llm progress-ack candidate failed model={} fallback continues",
+                                candidate.label
+                            ),
+                            &err,
+                        );
+                    }
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        Ok(None)
+    }
 }
 
 /// 统一的瞬时失败回复文案。
 pub fn temporary_network_reply() -> String {
     "网不太好，我这边请求超时了，等会再试试。".to_string()
+}
+
+/// Formats one tool failure together with a machine-readable next-step hint for the model.
+///
+/// 这些提示不是给用户看的，而是给模型下一轮观察用的：
+/// - 当前工具为什么失败
+/// - 更合理的下一步替代动作是什么
+pub(crate) fn tool_error_with_hint(tool: &str, message: impl Display, next_hint: &str) -> String {
+    let next_hint = next_hint.trim();
+    if next_hint.is_empty() {
+        format!("{tool} error: {message}")
+    } else {
+        format!("{tool} error: {message}\n\n[next_hint]\n{next_hint}")
+    }
 }
 
 /// 粗判 LLM 错误是否属于“适合切换模型再试一次”的瞬时失败。
@@ -141,6 +213,25 @@ fn is_transient_llm_error(err: &Error) -> bool {
     }
 
     let text = err.to_string().to_lowercase();
+    if [
+        "invalid value",
+        "invalid_request_error",
+        "missing required",
+        "unsupported value",
+        "unsupported type",
+        "schema",
+        "must be at the beginning",
+        "context length",
+        "maximum context length",
+        "请求参数异常",
+        "升级客户端后重试",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        return false;
+    }
+
     [
         "timeout",
         "timed out",

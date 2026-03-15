@@ -98,6 +98,23 @@ impl Llm for MockLlm {
 
         Ok(reply)
     }
+
+    async fn progress_ack(
+        &self,
+        _session_id: String,
+        messages: Vec<(String, String)>,
+    ) -> anyhow::Result<Option<String>> {
+        let last_user_message = messages
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.clone())
+            .unwrap_or_default();
+        if last_user_message.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(format!("Mock Ack: {}", last_user_message.trim())))
+    }
 }
 
 /// Lightweight heuristic for deciding whether mock mode should call search tool.

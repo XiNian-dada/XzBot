@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
+use tokio::sync::mpsc;
 
 use crate::{
     bot::ai_chat::AiChatPlugin,
@@ -47,7 +48,11 @@ impl BotRouter {
     }
 
     /// Routes one incoming message event to zero or more OneBot actions.
-    pub async fn route_message(&self, event: MessageEvent) -> Result<Vec<ActionRequest>> {
+    pub async fn route_message(
+        &self,
+        event: MessageEvent,
+        progress_tx: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<Vec<ActionRequest>> {
         if event.post_type != "message" {
             log_debug(
                 self.config.debug,
@@ -129,7 +134,7 @@ impl BotRouter {
             ),
         );
         let mut actions = plugin_actions;
-        actions.extend(self.ai_chat.handle_message(event).await?);
+        actions.extend(self.ai_chat.handle_message(event, progress_tx).await?);
         Ok(actions)
     }
 

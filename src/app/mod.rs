@@ -643,7 +643,7 @@ fn handle_incoming_payload(
     let bridge = bridge.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let action_texts = process_incoming(&state, &bridge, value).await;
+        let action_texts = process_incoming(&state, &bridge, &tx, value).await;
         for action_text in action_texts {
             let _ = tx.send(action_text);
         }
@@ -661,6 +661,7 @@ fn handle_incoming_payload(
 async fn process_incoming(
     state: &AppState,
     bridge: &WsActionBridge,
+    action_tx: &mpsc::UnboundedSender<String>,
     payload: Value,
 ) -> Vec<String> {
     if payload.get("post_type").and_then(Value::as_str) != Some("message") {
@@ -707,24 +708,18 @@ async fn process_incoming(
 
     // 管理指令优先级高于普通 AI/插件路由，避免 owner 指令被错误吞进会话上下文。
     if let Some(action) = try_reload_config_command(state, &event, &config).await {
-        return serde_json::to_string(&action).ok().into_iter().collect();
+        return serialize_actions(vec![action]);
     }
 
     if let Some(actions) = try_post_token_command(state, &event, &config).await {
-        return actions
-            .into_iter()
-            .filter_map(|v| serde_json::to_string(&v).ok())
-            .collect();
+        return serialize_actions(actions);
     }
 
     if let Some(actions) = try_dump_log_command(state, &event, &config).await {
-        return actions
-            .into_iter()
-            .filter_map(|v| serde_json::to_string(&v).ok())
-            .collect();
+        return serialize_actions(actions);
     }
 
-    let actions = match router.route_message(event).await {
+    let actions = match router.route_message(event, Some(action_tx.clone())).await {
         Ok(action) => action,
         Err(err) => {
             log_error_err("route message failed", &err);
@@ -732,10 +727,7 @@ async fn process_incoming(
         }
     };
 
-    actions
-        .into_iter()
-        .filter_map(|v| serde_json::to_string(&v).ok())
-        .collect()
+    serialize_actions(actions)
 }
 
 /// Extracts access token from headers or query params.
@@ -779,4 +771,12 @@ fn header_token(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string())
+}
+
+/// Serializes OneBot actions into websocket text frames, skipping impossible-to-encode items.
+fn serialize_actions(actions: Vec<ActionRequest>) -> Vec<String> {
+    actions
+        .into_iter()
+        .filter_map(|value| serde_json::to_string(&value).ok())
+        .collect()
 }
