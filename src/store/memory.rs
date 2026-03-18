@@ -36,6 +36,8 @@ impl SessionKey {
 pub struct MemoryStore {
     // 保存 (role, content)，并在写入时裁剪到最近 10 轮（20 条消息）。
     sessions: DashMap<SessionKey, Vec<(String, String)>>,
+    // 保存每个群最近的原始聊天摘录，供被 @ 时补作“群内最近发生了什么”的环境上下文。
+    recent_group_messages: DashMap<i64, Vec<String>>,
 }
 
 impl MemoryStore {
@@ -43,6 +45,7 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            recent_group_messages: DashMap::new(),
         }
     }
 
@@ -98,5 +101,69 @@ impl MemoryStore {
         }
 
         entry.clone()
+    }
+
+    /// Appends one summarized group message into the rolling recent-message buffer.
+    ///
+    /// 这条缓冲区和 AI 对话历史不同：
+    /// - 它保存的是“群里最近说过什么”
+    /// - 目的是让机器人在被 @ 时，能看到刚刚几条并非直接对它说的话
+    pub fn push_recent_group_message(&self, group_id: i64, content: String) {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let mut entry = self
+            .recent_group_messages
+            .entry(group_id)
+            .or_insert_with(Vec::new);
+        entry.push(trimmed.to_string());
+
+        if entry.len() > 30 {
+            let overflow = entry.len() - 30;
+            entry.drain(0..overflow);
+        }
+    }
+
+    /// Returns up to `limit` recent summarized group messages in chronological order.
+    pub fn recent_group_messages(&self, group_id: i64, limit: usize) -> Vec<String> {
+        self.recent_group_messages
+            .get(&group_id)
+            .map(|entry| {
+                let len = entry.len();
+                let start = len.saturating_sub(limit);
+                entry[start..].to_vec()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Renders a compact recent-group-context block for model/tool consumption.
+    pub fn recent_group_context(
+        &self,
+        group_id: i64,
+        limit: usize,
+        max_chars: usize,
+    ) -> Option<String> {
+        let recent = self.recent_group_messages(group_id, limit);
+        if recent.is_empty() {
+            return None;
+        }
+
+        let mut out = String::from("[最近群聊]\n");
+        for (idx, line) in recent.iter().enumerate() {
+            let item = format!("{}. {}\n", idx + 1, line);
+            if out.len() + item.len() > max_chars {
+                break;
+            }
+            out.push_str(&item);
+        }
+
+        let trimmed = out.trim().to_string();
+        if trimmed == "[最近群聊]" {
+            None
+        } else {
+            Some(trimmed)
+        }
     }
 }

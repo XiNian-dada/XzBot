@@ -3,10 +3,12 @@
 use async_trait::async_trait;
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
 use crate::{
     config::{NetworkConfig, SearchConfig},
     llm::Llm,
+    store::memory::MemoryStore,
     tools::system::get_system_info,
     tools::{
         http::build_client,
@@ -20,6 +22,7 @@ pub struct MockLlm {
     debug: bool,
     search: SearchConfig,
     network: NetworkConfig,
+    _store: Arc<MemoryStore>,
 }
 
 impl MockLlm {
@@ -29,6 +32,7 @@ impl MockLlm {
         timeout_ms: u64,
         search: SearchConfig,
         network: NetworkConfig,
+        store: Arc<MemoryStore>,
     ) -> Result<Self> {
         let client = build_client(timeout_ms, &network, false)
             .context("failed to build HTTP client for MockLlm")?;
@@ -37,6 +41,7 @@ impl MockLlm {
             debug,
             search,
             network,
+            _store: store,
         })
     }
 }

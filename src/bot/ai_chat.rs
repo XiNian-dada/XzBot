@@ -7,11 +7,11 @@
 //!
 //! 它本身不关心 HTTP、WebSocket 或搜索实现细节，只协调对话过程。
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use dashmap::{mapref::entry::Entry, DashMap};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     config::Config,
@@ -31,6 +31,52 @@ pub struct AiChatPlugin {
     reply_locks: Arc<DashMap<String, Arc<Semaphore>>>,
 }
 
+/// 活跃的多阶段进度会话。
+///
+/// 只要这个 guard 仍然活着，后台的“仍在处理 / 可能较慢”提示就有机会继续发送；
+/// 一旦 guard 被 drop，后台定时更新就会立刻停止。
+pub struct ProgressSession {
+    done_tx: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for ProgressSession {
+    fn drop(&mut self) {
+        if let Some(done_tx) = self.done_tx.take() {
+            let _ = done_tx.send(());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProgressTarget {
+    kind: ProgressTargetKind,
+    target_id: i64,
+    prefix: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ProgressTargetKind {
+    Private,
+    Group,
+}
+
+#[derive(Clone)]
+struct ProgressContext {
+    key: SessionKey,
+    user_text: String,
+    target: ProgressTarget,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProgressPhase {
+    Start,
+    Working,
+    Slow,
+}
+
+const INITIAL_PROGRESS_TIMEOUT: Duration = Duration::from_millis(450);
+const FOLLOWUP_PROGRESS_TIMEOUT: Duration = Duration::from_millis(800);
+
 impl AiChatPlugin {
     /// Creates a new AI chat plugin instance.
     pub fn new(store: Arc<MemoryStore>, llm: Arc<dyn Llm>, config: Arc<Config>) -> Self {
@@ -43,15 +89,7 @@ impl AiChatPlugin {
     }
 
     /// Handles one message event and returns reply actions.
-    ///
-    /// 这里既支持传统的“最终只回一条”，也支持慢任务场景下的“双阶段回复”：
-    /// - 先通过 `progress_tx` 立即发一条轻量确认消息
-    /// - 再在模型/工具完成后返回最终回复动作
-    pub async fn handle_message(
-        &self,
-        event: MessageEvent,
-        progress_tx: Option<mpsc::UnboundedSender<String>>,
-    ) -> Result<Vec<ActionRequest>> {
+    pub async fn handle_message(&self, event: MessageEvent) -> Result<Vec<ActionRequest>> {
         let raw_text = event.text();
         let trimmed = raw_text.trim();
 
@@ -61,16 +99,121 @@ impl AiChatPlugin {
         }
 
         match event.message_type.as_str() {
-            "private" => {
-                self.handle_private_message(event, trimmed, progress_tx)
-                    .await
-            }
-            "group" => {
-                self.handle_group_message(event, raw_text.clone(), progress_tx)
-                    .await
-            }
+            "private" => self.handle_private_message(event, trimmed).await,
+            "group" => self.handle_group_message(event, raw_text.clone()).await,
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Starts a staged progress session before expensive enrichment/tool work begins.
+    ///
+    /// 这一步的目标很明确：
+    /// - 先发第一句“我开始查了”
+    /// - 再允许后台在任务拖慢时追加一两句更新
+    /// - 最终结果一旦返回，就停止这些中途提示
+    pub async fn start_progress_session(
+        &self,
+        event: &MessageEvent,
+        progress_tx: mpsc::UnboundedSender<String>,
+    ) -> Option<ProgressSession> {
+        let ctx = match self.build_progress_context(event) {
+            Some(ctx) => ctx,
+            None => {
+                log_debug(
+                    self.config.debug,
+                    "progress session skipped: context not eligible",
+                );
+                return None;
+            }
+        };
+        if !self.is_reply_lock_available(&ctx.key) {
+            log_debug(
+                self.config.debug,
+                "progress session skipped: reply lock busy",
+            );
+            return None;
+        }
+
+        let first = match self
+            .generate_progress_message(
+                &ctx.key,
+                &ctx.user_text,
+                ProgressPhase::Start,
+                &[],
+                INITIAL_PROGRESS_TIMEOUT,
+            )
+            .await
+        {
+            Some(text) => text,
+            None => {
+                log_debug(
+                    self.config.debug,
+                    "progress session skipped: no initial message within budget",
+                );
+                return None;
+            }
+        };
+        if !send_progress_action(
+            &progress_tx,
+            &ctx.target,
+            &first,
+            self.config.debug,
+            "start",
+        ) {
+            return None;
+        }
+
+        let llm = self.llm.clone();
+        let config = self.config.clone();
+        let key = ctx.key.clone();
+        let user_text = ctx.user_text.clone();
+        let target = ctx.target.clone();
+        let debug = self.config.debug;
+        let (done_tx, mut done_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut sent = vec![first];
+            let phases = [
+                (Duration::from_secs(3), ProgressPhase::Working, "working"),
+                (Duration::from_secs(8), ProgressPhase::Slow, "slow"),
+            ];
+            let mut elapsed = Duration::ZERO;
+
+            for (deadline, phase, label) in phases {
+                let wait = deadline.saturating_sub(elapsed);
+                elapsed = deadline;
+                tokio::select! {
+                    _ = &mut done_rx => return,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+
+                let Some(text) = generate_progress_message_with(
+                    llm.clone(),
+                    config.clone(),
+                    &key,
+                    &user_text,
+                    phase,
+                    &sent,
+                    FOLLOWUP_PROGRESS_TIMEOUT,
+                )
+                .await
+                else {
+                    continue;
+                };
+
+                if sent.iter().any(|previous| previous == &text) {
+                    continue;
+                }
+                if !send_progress_action(&progress_tx, &target, &text, debug, label) {
+                    return;
+                }
+                sent.push(text);
+            }
+        });
+
+        Some(ProgressSession {
+            done_tx: Some(done_tx),
+        })
     }
 
     /// Handles private chat flow, including `/reset` and lock gate.
@@ -78,7 +221,6 @@ impl AiChatPlugin {
         &self,
         event: MessageEvent,
         trimmed: &str,
-        progress_tx: Option<mpsc::UnboundedSender<String>>,
     ) -> Result<Vec<ActionRequest>> {
         let key = SessionKey::new("private", None, event.user_id);
 
@@ -104,14 +246,6 @@ impl AiChatPlugin {
                 "别急别急，我还在回复上一条消息。".to_string(),
             )]);
         };
-        self.maybe_emit_progress_ack(
-            progress_tx.as_ref(),
-            &key,
-            trimmed,
-            ActionRequest::send_private_msg(event.user_id, String::new()),
-            None,
-        )
-        .await;
         let reply = self.generate_ai_reply(key, trimmed.to_string()).await?;
         Ok(vec![ActionRequest::send_private_msg(event.user_id, reply)])
     }
@@ -121,7 +255,6 @@ impl AiChatPlugin {
         &self,
         event: MessageEvent,
         raw_text: String,
-        progress_tx: Option<mpsc::UnboundedSender<String>>,
     ) -> Result<Vec<ActionRequest>> {
         let Some(group_id) = event.group_id else {
             return Ok(Vec::new());
@@ -191,18 +324,6 @@ impl AiChatPlugin {
             };
             return Ok(vec![ActionRequest::send_group_msg(group_id, busy)]);
         };
-        self.maybe_emit_progress_ack(
-            progress_tx.as_ref(),
-            &key,
-            &prompt_body,
-            ActionRequest::send_group_msg(group_id, String::new()),
-            if self.config.group.mention_sender {
-                Some(format!("[CQ:at,qq={}] ", event.user_id))
-            } else {
-                None
-            },
-        )
-        .await;
         let reply = self.generate_ai_reply(key, prompt).await?;
         let message = if self.config.group.mention_sender {
             format!("[CQ:at,qq={}] {}", event.user_id, reply)
@@ -273,79 +394,16 @@ impl AiChatPlugin {
         Ok(reply)
     }
 
-    /// Emits one immediate progress action via the live websocket sender.
-    ///
-    /// 这里不再硬编码固定文案，而是让模型先决定：
-    /// - 是否需要“先回一句”
-    /// - 如果需要，该如何用当前人设自然地说这一句
-    ///
-    /// 若模型返回 `SKIP` 或空串，则本轮不发送前置 ack。
-    async fn maybe_emit_progress_ack(
-        &self,
-        progress_tx: Option<&mpsc::UnboundedSender<String>>,
-        key: &SessionKey,
-        user_text: &str,
-        action: ActionRequest,
-        prefix: Option<String>,
-    ) {
-        let Some(progress_tx) = progress_tx else {
-            return;
-        };
-        if !self.should_request_progress_ack(user_text) {
-            return;
-        }
-
-        let Some(ack) = self.generate_progress_ack(key, user_text).await else {
-            return;
-        };
-
-        let ack = match prefix {
-            Some(prefix) => format!("{prefix}{ack}"),
-            None => ack,
-        };
-
-        let action = match action.action.as_str() {
-            "send_private_msg" => {
-                let user_id = action
-                    .params
-                    .get("user_id")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or_default();
-                ActionRequest::send_private_msg(user_id, ack)
-            }
-            "send_group_msg" => {
-                let group_id = action
-                    .params
-                    .get("group_id")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or_default();
-                ActionRequest::send_group_msg(group_id, ack)
-            }
-            _ => return,
-        };
-
-        let encoded = match serde_json::to_string(&action) {
-            Ok(v) => v,
-            Err(err) => {
-                log_warn(format!("failed to encode progress action: {err}"));
-                return;
-            }
-        };
-
-        if progress_tx.send(encoded).is_err() {
-            log_warn("failed to send progress action to websocket");
-            return;
-        }
-
-        log_debug(self.config.debug, "progress ack action sent");
-    }
-
     /// Heuristic gate for deciding whether this turn is likely to be slow/tool-heavy.
     ///
     /// 这里仍然由宿主控制“是否值得两阶段回复”，但具体前置文案交给模型来写。
     fn should_request_progress_ack(&self, text: &str) -> bool {
         let lower = text.to_lowercase();
         text.contains("[IMAGE:")
+            || lower.contains("[cq:image")
+            || lower.contains("[cq:file")
+            || lower.contains("[cq:reply")
+            || lower.contains("[cq:forward")
             || lower.contains("http://")
             || lower.contains("https://")
             || lower.contains("天气")
@@ -365,44 +423,99 @@ impl AiChatPlugin {
             || lower.contains("系统")
             || lower.contains("进程")
             || lower.contains("图片")
+            || lower.contains("文件")
+            || lower.contains("聊天记录")
+            || lower.contains("转发")
             || lower.contains("分析")
             || lower.contains("analyze")
             || lower.contains("fetch")
             || lower.contains("search")
     }
 
-    /// Ask the model whether this turn deserves a short “processing…” acknowledgement.
-    async fn generate_progress_ack(&self, key: &SessionKey, user_text: &str) -> Option<String> {
-        let trimmed = user_text.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let (resolved_prompt, _) = self.config.persona.resolve_system_for_group(key.group_id);
-        let progress_system = format!(
-            "{}\n\n附加任务：你现在不是正式回答问题，只做一件事：生成一句很短的处理中过渡语，表示你已经开始查了。\n- 这句是发给用户的前置回复，不是最终答案。\n- 禁止给出任何事实结论。\n- 禁止解释原因。\n- 禁止使用 markdown。\n- 语气要符合当前人设。\n- 尽量口语化，最多 18 个字。",
-            resolved_prompt.trim()
-        );
-
-        let progress_messages = vec![
-            ("system".to_string(), progress_system),
-            ("user".to_string(), trimmed.to_string()),
-        ];
-        let session_id = format!(
-            "{}:{}:{}:progress_ack",
-            self.config.ai.provider.as_str(),
-            self.config.ai.model,
-            key.session_id()
-        );
-
-        match self.llm.progress_ack(session_id, progress_messages).await {
-            Ok(Some(reply)) => sanitize_progress_ack(&reply),
-            Ok(None) => None,
-            Err(err) => {
-                log_warn(format!("progress ack generation failed: {err}"));
-                None
+    fn build_progress_context(&self, event: &MessageEvent) -> Option<ProgressContext> {
+        let raw_text = event.text();
+        match event.message_type.as_str() {
+            "private" => {
+                let trimmed = raw_text.trim();
+                if trimmed.is_empty()
+                    || trimmed == "/reset"
+                    || !self.should_request_progress_ack(trimmed)
+                {
+                    return None;
+                }
+                Some(ProgressContext {
+                    key: SessionKey::new("private", None, event.user_id),
+                    user_text: trimmed.to_string(),
+                    target: ProgressTarget {
+                        kind: ProgressTargetKind::Private,
+                        target_id: event.user_id,
+                        prefix: None,
+                    },
+                })
             }
+            "group" => {
+                let group_id = event.group_id?;
+                let at_me = format!("[CQ:at,qq={}]", event.self_id);
+                let mut prompt = raw_text.replace(&at_me, "").trim().to_string();
+                if prompt.starts_with("/reset") {
+                    return None;
+                }
+                for prefix in &self.config.group.prefixes {
+                    let trimmed = prompt.trim_start();
+                    if !prefix.is_empty() && trimmed.starts_with(prefix) {
+                        prompt = trimmed.replacen(prefix, "", 1).trim().to_string();
+                        break;
+                    }
+                }
+                let prompt_body = prompt.trim().to_string();
+                if prompt_body.is_empty() || !self.should_request_progress_ack(&prompt_body) {
+                    return None;
+                }
+                Some(ProgressContext {
+                    key: SessionKey::new("group", Some(group_id), 0),
+                    user_text: prompt_body,
+                    target: ProgressTarget {
+                        kind: ProgressTargetKind::Group,
+                        target_id: group_id,
+                        prefix: if self.config.group.mention_sender {
+                            Some(format!("[CQ:at,qq={}] ", event.user_id))
+                        } else {
+                            None
+                        },
+                    },
+                })
+            }
+            _ => None,
         }
+    }
+
+    fn is_reply_lock_available(&self, key: &SessionKey) -> bool {
+        let lock_key = key.session_id();
+        self.reply_locks
+            .get(&lock_key)
+            .map(|semaphore| semaphore.available_permits() > 0)
+            .unwrap_or(true)
+    }
+
+    /// Generates one short progress line for the given stage.
+    async fn generate_progress_message(
+        &self,
+        key: &SessionKey,
+        user_text: &str,
+        phase: ProgressPhase,
+        previous: &[String],
+        timeout_budget: Duration,
+    ) -> Option<String> {
+        generate_progress_message_with(
+            self.llm.clone(),
+            self.config.clone(),
+            key,
+            user_text,
+            phase,
+            previous,
+            timeout_budget,
+        )
+        .await
     }
 
     /// Acquires per-session reply semaphore without waiting.
@@ -430,14 +543,127 @@ impl AiChatPlugin {
     }
 }
 
+fn send_progress_action(
+    progress_tx: &mpsc::UnboundedSender<String>,
+    target: &ProgressTarget,
+    text: &str,
+    debug: bool,
+    label: &str,
+) -> bool {
+    let text = match &target.prefix {
+        Some(prefix) => format!("{prefix}{text}"),
+        None => text.to_string(),
+    };
+    let action = match target.kind {
+        ProgressTargetKind::Private => ActionRequest::send_private_msg(target.target_id, text),
+        ProgressTargetKind::Group => ActionRequest::send_group_msg(target.target_id, text),
+    };
+    let encoded = match serde_json::to_string(&action) {
+        Ok(v) => v,
+        Err(err) => {
+            log_warn(format!("failed to encode progress action: {err}"));
+            return false;
+        }
+    };
+
+    if progress_tx.send(encoded).is_err() {
+        log_warn("failed to send progress action to websocket");
+        return false;
+    }
+
+    log_debug(debug, format!("progress {label} action sent"));
+    true
+}
+
+async fn generate_progress_message_with(
+    llm: Arc<dyn Llm>,
+    config: Arc<Config>,
+    key: &SessionKey,
+    user_text: &str,
+    phase: ProgressPhase,
+    previous: &[String],
+    timeout_budget: Duration,
+) -> Option<String> {
+    let trimmed = user_text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (resolved_prompt, _) = config.persona.resolve_system_for_group(key.group_id);
+    let stage_instruction = match phase {
+        ProgressPhase::Start => {
+            "你现在不是正式回答问题，只做一件事：生成一句很短的处理中过渡语，表示你已经开始查了。"
+        }
+        ProgressPhase::Working => {
+            "任务还在处理中。生成一句很短的中途更新，表示你还在查、还在看、还在拉取内容。"
+        }
+        ProgressPhase::Slow => {
+            "任务明显比预期更慢。生成一句很短的中途更新，口语化地表示还在等结果，可以委婉提到网页/网络/对方站点有点慢，但不要把原因说死。"
+        }
+    };
+    let previous_block = if previous.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n- 之前已经发过：{}",
+            previous
+                .iter()
+                .map(|line| format!("“{line}”"))
+                .collect::<Vec<_>>()
+                .join("、")
+        )
+    };
+    let progress_system = format!(
+        "{}\n\n附加任务：{}\n- 这句是发给用户的阶段性回复，不是最终答案。\n- 禁止给出任何事实结论。\n- 禁止解释完整原因。\n- 禁止使用 markdown。\n- 语气要符合当前人设。\n- 尽量口语化。\n- 避免和之前已经发过的话重复。\n- 最多 20 个字。{}",
+        resolved_prompt.trim(),
+        stage_instruction,
+        previous_block
+    );
+
+    let progress_messages = vec![
+        ("system".to_string(), progress_system),
+        ("user".to_string(), trimmed.to_string()),
+    ];
+    let session_id = format!(
+        "{}:{}:{}:progress_ack",
+        config.ai.provider.as_str(),
+        config.ai.model,
+        key.session_id()
+    );
+
+    match tokio::time::timeout(
+        timeout_budget,
+        llm.progress_ack(session_id, progress_messages),
+    )
+    .await
+    {
+        Err(_) => {
+            log_warn(format!(
+                "progress message generation timed out phase={:?} budget_ms={}",
+                phase,
+                timeout_budget.as_millis()
+            ));
+            None
+        }
+        Ok(result) => match result {
+            Ok(Some(reply)) => sanitize_progress_text(&reply),
+            Ok(None) => None,
+            Err(err) => {
+                log_warn(format!("progress message generation failed: {err}"));
+                None
+            }
+        },
+    }
+}
+
 /// Sanitizes model-generated progress text into a single short line.
-fn sanitize_progress_ack(text: &str) -> Option<String> {
+fn sanitize_progress_text(text: &str) -> Option<String> {
     let first_line = text
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("");
-    if first_line.is_empty() {
+    if first_line.is_empty() || first_line.eq_ignore_ascii_case("skip") {
         return None;
     }
 

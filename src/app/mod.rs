@@ -48,7 +48,10 @@ use crate::{
         warn as log_warn, warn_err as log_warn_err,
     },
     onebot::action::ActionRequest,
-    onebot::event::{extract_cq_image_refs, MessageEvent, MessagePayload},
+    onebot::event::{
+        extract_cq_file_refs, extract_cq_forward_ids, extract_cq_image_refs, MessageEvent,
+        MessageFileRef, MessagePayload,
+    },
     plugins::PluginManager,
     post_api::{chat_target_desc, ChatTokenStore},
     store::memory::MemoryStore,
@@ -67,6 +70,7 @@ use enrich::*;
 ///
 /// 这样 OneBot 回流这条消息时，路由层可以识别出它是“系统代发”，而不是用户真实输入。
 const POST_CONTEXT_MARKER: &str = "\u{2063}\u{2064}\u{2063}\u{2064}";
+const RECENT_GROUP_MESSAGE_MAX_CHARS: usize = 900;
 
 /// axum 路由共享状态。
 #[derive(Clone)]
@@ -235,7 +239,7 @@ fn build_runtime(
     store: Arc<MemoryStore>,
     plugins: PluginManager,
 ) -> anyhow::Result<RuntimeState> {
-    let llm = build_llm_chain(&config, plugins.clone())?;
+    let llm = build_llm_chain(&config, store.clone(), plugins.clone())?;
     let ai_chat = AiChatPlugin::new(store, llm, config.clone());
     let router = Arc::new(BotRouter::new(ai_chat, plugins, config.clone()));
 
@@ -248,7 +252,11 @@ fn build_runtime(
 /// - `ai.model` 作为主模型
 /// - `ai.fallback_models` 依次作为候补
 /// - 所有候选共享同一套 provider/base_url/api_key 等参数
-fn build_llm_chain(config: &Arc<Config>, plugins: PluginManager) -> anyhow::Result<Arc<dyn Llm>> {
+fn build_llm_chain(
+    config: &Arc<Config>,
+    store: Arc<MemoryStore>,
+    plugins: PluginManager,
+) -> anyhow::Result<Arc<dyn Llm>> {
     let mut candidates = Vec::new();
 
     for model in config.ai.model_chain() {
@@ -261,11 +269,13 @@ fn build_llm_chain(config: &Arc<Config>, plugins: PluginManager) -> anyhow::Resu
                 ai_config.timeout_ms,
                 config.search.clone(),
                 config.network.clone(),
+                store.clone(),
             )?),
             AiProvider::OpenaiCompatible => Arc::new(OpenAiCompatibleLlm::from_config(
                 &ai_config,
                 &config.search,
                 &config.network,
+                store.clone(),
                 config.debug,
                 false,
                 plugins.clone(),
@@ -274,6 +284,7 @@ fn build_llm_chain(config: &Arc<Config>, plugins: PluginManager) -> anyhow::Resu
                 &ai_config,
                 &config.search,
                 &config.network,
+                store.clone(),
                 config.debug,
                 plugins.clone(),
             )?),
@@ -655,9 +666,10 @@ fn handle_incoming_payload(
 /// 这是消息事件进入业务层前的最后一道编排逻辑，顺序不能乱：
 /// 1. 只放行 `post_type=message`
 /// 2. 跳过内部 POST 回流消息
-/// 3. 富化图片/引用上下文
-/// 4. 处理高优先级管理指令
-/// 5. 最后才交给 BotRouter
+/// 3. 先处理高优先级管理指令
+/// 4. 若大概率会进入 AI，先启动阶段性进度回复
+/// 5. 再做图片/引用/文件/转发等慢富化
+/// 6. 最后交给 BotRouter
 async fn process_incoming(
     state: &AppState,
     bridge: &WsActionBridge,
@@ -693,11 +705,6 @@ async fn process_incoming(
         return Vec::new();
     }
 
-    // 富化失败不拦截消息主流程，只记录警告。否则图片链路偶发失败会让整个机器人失语。
-    if let Err(err) = enrich_event_images(&mut event, bridge, config.debug).await {
-        log_warn_err("failed to enrich image context", &err);
-    }
-
     log_debug(
         config.debug,
         format!(
@@ -719,13 +726,36 @@ async fn process_incoming(
         return serialize_actions(actions);
     }
 
-    let actions = match router.route_message(event, Some(action_tx.clone())).await {
+    // 进度提示必须早于慢富化，否则用户看到的顺序会变成“先抓网页，再说我去查”。
+    let _progress_session = router
+        .maybe_start_progress_session(&event, Some(action_tx.clone()))
+        .await;
+
+    // 富化失败不拦截消息主流程，只记录警告。否则图片链路偶发失败会让整个机器人失语。
+    if let Err(err) = enrich_event_images(&mut event, bridge, config.debug, &config.network).await {
+        log_warn_err("failed to enrich image context", &err);
+    }
+
+    let recent_group_push = if event.message_type == "group" && event.user_id != event.self_id {
+        event
+            .group_id
+            .and_then(|group_id| build_recent_group_entry(&event).map(|entry| (group_id, entry)))
+    } else {
+        None
+    };
+
+    let actions = match router.route_message(event).await {
         Ok(action) => action,
         Err(err) => {
             log_error_err("route message failed", &err);
             return Vec::new();
         }
     };
+
+    // 最近群聊上下文改成按需工具查询，所以这里只把当前消息写进缓存，不再注入当前轮 prompt。
+    if let Some((group_id, entry)) = recent_group_push {
+        state.store.push_recent_group_message(group_id, entry);
+    }
 
     serialize_actions(actions)
 }
@@ -779,4 +809,36 @@ fn serialize_actions(actions: Vec<ActionRequest>) -> Vec<String> {
         .into_iter()
         .filter_map(|value| serde_json::to_string(&value).ok())
         .collect()
+}
+
+/// Builds one summarized current-group-message entry for the rolling recent-message buffer.
+fn build_recent_group_entry(event: &MessageEvent) -> Option<String> {
+    if event.message_type != "group" {
+        return None;
+    }
+
+    let text = trim_for_recent_context(event.text().trim(), RECENT_GROUP_MESSAGE_MAX_CHARS);
+    if text.is_empty() {
+        return None;
+    }
+
+    let display_name = event.display_name();
+    if display_name == event.user_id.to_string() {
+        Some(format!("[{}] {}", event.user_id, text))
+    } else {
+        Some(format!("[{}({})] {}", display_name, event.user_id, text))
+    }
+}
+
+/// Trims one ambient recent-message entry so one long file/forward payload does not eat the entire context budget.
+fn trim_for_recent_context(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for ch in normalized.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if normalized.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }

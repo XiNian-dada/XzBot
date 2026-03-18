@@ -76,7 +76,7 @@ impl OpenAiCompatibleLlm {
                         );
                     }
                     ctx.input.push(build_responses_function_call_item(&call));
-                    let result = self.execute_tool_call(&call).await;
+                    let result = self.execute_tool_call(&session_id, &call).await;
                     ctx.input
                         .push(build_responses_function_call_output_item(&call.id, &result));
                     continue;
@@ -141,7 +141,7 @@ impl OpenAiCompatibleLlm {
                 if !signature.is_empty() {
                     executed_tool_signatures.insert(signature);
                 }
-                let result = self.execute_tool_call(&call).await;
+                let result = self.execute_tool_call(&session_id, &call).await;
                 executed_in_this_round += 1;
                 ctx.input
                     .push(build_responses_function_call_output_item(&call.id, &result));

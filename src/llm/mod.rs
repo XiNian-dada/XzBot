@@ -187,6 +187,21 @@ pub fn temporary_network_reply() -> String {
     "网不太好，我这边请求超时了，等会再试试。".to_string()
 }
 
+/// Extracts group id from a chat session identifier when the current turn is a group session.
+///
+/// Session ids are assembled as `provider:model:group:<group_id>:<user_id>` for group chats.
+pub fn session_group_id(session_id: &str) -> Option<i64> {
+    let mut parts = session_id.split(':');
+    let _provider = parts.next()?;
+    let _model = parts.next()?;
+    let chat_type = parts.next()?;
+    if chat_type != "group" {
+        return None;
+    }
+    let group_id = parts.next()?;
+    group_id.parse::<i64>().ok()
+}
+
 /// Formats one tool failure together with a machine-readable next-step hint for the model.
 ///
 /// 这些提示不是给用户看的，而是给模型下一轮观察用的：

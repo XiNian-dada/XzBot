@@ -8,6 +8,7 @@
 //!
 //! 解析细节与 Responses 子流程被拆到子模块，避免主文件继续膨胀。
 
+use std::sync::Arc;
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,9 +22,10 @@ use crate::{
         message_parts::{parse_user_content, ParsedUserContent},
         ocr::{ocr_images_to_text, OcrSettings},
     },
-    llm::{tool_error_with_hint, Llm},
+    llm::{session_group_id, tool_error_with_hint, Llm},
     logger::warn_err as log_warn_err,
     plugins::PluginManager,
+    store::memory::MemoryStore,
     token_stats,
     tools::system::{get_process_info, get_system_info},
     tools::weather::get_weather,
@@ -61,6 +63,7 @@ pub struct OpenAiCompatibleLlm {
     suppress_transient_errors: bool,
     search: SearchConfig,
     network: NetworkConfig,
+    store: Arc<MemoryStore>,
     plugins: PluginManager,
     vision_mode: VisionMode,
     ocr_settings: OcrSettings,
@@ -129,6 +132,7 @@ impl OpenAiCompatibleLlm {
         config: &AiConfig,
         search: &SearchConfig,
         network: &NetworkConfig,
+        store: Arc<MemoryStore>,
         debug: bool,
         suppress_transient_errors: bool,
         plugins: PluginManager,
@@ -154,6 +158,7 @@ impl OpenAiCompatibleLlm {
             suppress_transient_errors,
             search: search.clone(),
             network: network.clone(),
+            store,
             plugins,
             vision_mode: config.vision_mode,
             ocr_settings: OcrSettings {
@@ -369,7 +374,7 @@ impl OpenAiCompatibleLlm {
                         );
                     }
                     messages.push(build_synthetic_assistant_tool_message(&call, &content));
-                    let result = self.execute_tool_call(&call).await;
+                    let result = self.execute_tool_call(&session_id, &call).await;
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": call.id,
@@ -388,7 +393,7 @@ impl OpenAiCompatibleLlm {
                             );
                         }
                         messages.push(build_synthetic_assistant_tool_message(&call, ""));
-                        let result = self.execute_tool_call(&call).await;
+                        let result = self.execute_tool_call(&session_id, &call).await;
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": call.id,
@@ -462,7 +467,7 @@ impl OpenAiCompatibleLlm {
                 if !signature.is_empty() {
                     executed_tool_signatures.insert(signature);
                 }
-                let result = self.execute_tool_call(&call).await;
+                let result = self.execute_tool_call(&session_id, &call).await;
                 executed_in_this_round += 1;
                 messages.push(json!({
                     "role": "tool",
@@ -1134,7 +1139,7 @@ impl OpenAiCompatibleLlm {
         }
     }
 
-    async fn execute_tool_call(&self, call: &OpenAiToolCall) -> String {
+    async fn execute_tool_call(&self, session_id: &str, call: &OpenAiToolCall) -> String {
         match call.name.as_str() {
             "search_web" => {
                 let query = extract_argument_str(&call.arguments, &["query", "q", "keyword"])
@@ -1258,6 +1263,28 @@ impl OpenAiCompatibleLlm {
                         "get_weather",
                         err,
                         "如果当前天气接口不稳定，可改用 search_web 搜索该地点的天气预报页面。",
+                    ),
+                }
+            }
+            "get_recent_group_context" => {
+                let limit = call
+                    .arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10)
+                    .clamp(1, 10) as usize;
+                let Some(group_id) = session_group_id(session_id) else {
+                    return tool_error_with_hint(
+                        "get_recent_group_context",
+                        "current session is not a group chat",
+                        "只能在群聊会话里查询最近群聊上下文。",
+                    );
+                };
+                match self.store.recent_group_context(group_id, limit, 8_000) {
+                    Some(v) => wrap_untrusted_tool_output("get_recent_group_context", v),
+                    None => wrap_untrusted_tool_output(
+                        "get_recent_group_context",
+                        "当前没有可用的最近群聊上下文。".to_string(),
                     ),
                 }
             }

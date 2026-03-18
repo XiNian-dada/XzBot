@@ -252,6 +252,15 @@ impl PluginManager {
         Ok(out)
     }
 
+    /// Returns true when at least one event plugin would see this message.
+    ///
+    /// 这个方法只做轻量预判，不触发插件进程调用。
+    /// 宿主可用它决定是否应该先保守地跳过 AI 侧的阶段回复。
+    pub fn has_matching_event_subscriber(&self, event: &MessageEvent) -> bool {
+        let ctx = PluginMessageContext::from_event(event, self.config.owner.qq);
+        self.plugins.iter().any(|plugin| plugin.matches_event(&ctx))
+    }
+
     /// Routes one slash command to its owning plugin.
     pub async fn try_handle_command(&self, event: &MessageEvent) -> Result<Vec<ActionRequest>> {
         let ctx = PluginMessageContext::from_event(event, self.config.owner.qq);
@@ -276,6 +285,13 @@ impl PluginManager {
             event,
             self.config.group.mention_sender,
         ))
+    }
+
+    /// Returns true when current text would be claimed by a command plugin.
+    pub fn has_matching_command(&self, normalized_text: &str) -> bool {
+        parse_command(normalized_text)
+            .map(|(cmd, _)| self.command_map.contains_key(&cmd))
+            .unwrap_or(false)
     }
 
     /// Executes one plugin-defined tool by name.
@@ -690,7 +706,9 @@ impl PluginMessageContext {
     /// 这里把事件分类、@ 信息、图片引用、引用回复等一次性整理好，
     /// 让插件不必反复猜 OneBot 原始结构。
     fn from_event(event: &MessageEvent, owner_qq: i64) -> Self {
-        let raw_text = event.text();
+        // 插件的“触发/命令/事件分类”必须只看原始消息，
+        // 否则像最近群聊这种 AI 侧的附加上下文会污染插件命中结果。
+        let raw_text = event.original_text();
         let at_me = format!("[CQ:at,qq={}]", event.self_id);
         let mentioned = raw_text.contains(&at_me);
         let normalized_text = raw_text.replace(&at_me, "").trim().to_string();
@@ -724,7 +742,9 @@ impl PluginMessageContext {
         Self {
             raw_text,
             normalized_text,
-            text: parsed.text,
+            // 插件正文保留完整富化文本，这样事件插件仍然能看到引用/文件/转发等扩展上下文。
+            // 但前面的命中与分类逻辑已经固定为原始消息，不会再被“最近群聊”误触发。
+            text: event.text(),
             message_type: event.message_type.clone(),
             user_id: event.user_id,
             group_id: event.group_id,

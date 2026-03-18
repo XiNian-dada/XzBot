@@ -14,7 +14,7 @@ use dashmap::{DashMap, DashSet};
 use tokio::sync::mpsc;
 
 use crate::{
-    bot::ai_chat::AiChatPlugin,
+    bot::ai_chat::{AiChatPlugin, ProgressSession},
     config::{Config, PermissionMode, TriggerMode},
     logger::debug as log_debug,
     onebot::{action::ActionRequest, event::MessageEvent},
@@ -48,11 +48,7 @@ impl BotRouter {
     }
 
     /// Routes one incoming message event to zero or more OneBot actions.
-    pub async fn route_message(
-        &self,
-        event: MessageEvent,
-        progress_tx: Option<mpsc::UnboundedSender<String>>,
-    ) -> Result<Vec<ActionRequest>> {
+    pub async fn route_message(&self, event: MessageEvent) -> Result<Vec<ActionRequest>> {
         if event.post_type != "message" {
             log_debug(
                 self.config.debug,
@@ -134,8 +130,23 @@ impl BotRouter {
             ),
         );
         let mut actions = plugin_actions;
-        actions.extend(self.ai_chat.handle_message(event, progress_tx).await?);
+        actions.extend(self.ai_chat.handle_message(event).await?);
         Ok(actions)
+    }
+
+    /// Starts an AI progress session before expensive enrichment when this turn is very likely to reach AI.
+    pub async fn maybe_start_progress_session(
+        &self,
+        event: &MessageEvent,
+        progress_tx: Option<mpsc::UnboundedSender<String>>,
+    ) -> Option<ProgressSession> {
+        let progress_tx = progress_tx?;
+        if !self.should_prepare_ai_progress(event) {
+            return None;
+        }
+        self.ai_chat
+            .start_progress_session(event, progress_tx)
+            .await
     }
 
     /// Gracefully shuts down all managed plugins.
@@ -176,7 +187,9 @@ impl BotRouter {
 
     /// Evaluates group trigger policy (`@`, prefix, keyword, mixed).
     fn should_trigger_group(&self, event: &MessageEvent) -> bool {
-        let raw_text = event.text();
+        // 触发判定只能看“当前这条消息原本说了什么”，不能被运行时追加的
+        // 最近群聊/引用展开等上下文污染，否则普通聊天也可能被误判为触发。
+        let raw_text = event.original_text();
         let at_me = format!("[CQ:at,qq={}]", event.self_id);
         let mentioned = raw_text.contains(&at_me);
         let normalized = raw_text.replace(&at_me, "").trim().to_string();
@@ -302,7 +315,8 @@ impl BotRouter {
             return None;
         }
 
-        let normalized = normalize_repeat_text(&event.text())?;
+        // “加一”只看用户这一条消息的原始内容，不能把最近群聊上下文一并算进去。
+        let normalized = normalize_repeat_text(&event.original_text())?;
         let mut state = self
             .group_repeat_state
             .entry(group_id)
@@ -352,6 +366,37 @@ impl BotRouter {
             _ => ActionRequest::send_private_msg(event.user_id, message),
         }
     }
+
+    /// Fast preflight used before enrichment so staged agent updates can start as early as possible.
+    fn should_prepare_ai_progress(&self, event: &MessageEvent) -> bool {
+        if event.post_type != "message" || event.user_id == event.self_id {
+            return false;
+        }
+        if self.handle_blacklist_command(event).is_some() {
+            return false;
+        }
+        if !self.allowed_by_permission(event) {
+            return false;
+        }
+        if event.message_type == "group" && !self.should_trigger_group(event) {
+            return false;
+        }
+
+        let normalized = normalize_command_text(event);
+        if normalized.is_empty() || normalized == "/reset" {
+            return false;
+        }
+        // 事件插件可能会完全接管这条消息；为了避免先发一条 AI 风格进度消息再被插件拦截，
+        // 这里先保守跳过 staged progress。宁可少发，不要把宿主边界打乱。
+        if self.plugins.has_matching_event_subscriber(event) {
+            return false;
+        }
+        if self.plugins.has_matching_command(&normalized) {
+            return false;
+        }
+
+        true
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -374,7 +419,8 @@ enum BlacklistCommand {
 
 /// Normalizes command text by stripping bot mention in groups.
 fn normalize_command_text(event: &MessageEvent) -> String {
-    let raw = event.text();
+    // 命令解析同样只能基于原始消息。
+    let raw = event.original_text();
     if event.message_type == "group" {
         let at_me = format!("[CQ:at,qq={}]", event.self_id);
         raw.replace(&at_me, "").trim().to_string()
@@ -425,11 +471,42 @@ fn normalize_repeat_text(text: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    // 带 CQ 码的消息（@、图片、回复等）不参与加一，避免误触发和噪音。
-    if trimmed.contains("[CQ:") {
+    // 仅允许纯文本和 QQ 基础表情参与“加一”。
+    // 其它 CQ 码（@、图片、回复、文件等）继续忽略，避免误触发和噪音。
+    if contains_non_face_cq(trimmed) {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// Returns true when the message contains CQ segments other than `[CQ:face,id=...]`.
+fn contains_non_face_cq(text: &str) -> bool {
+    let mut cursor = 0usize;
+    while let Some(start_rel) = text[cursor..].find("[CQ:") {
+        let start = cursor + start_rel;
+        let Some(end_rel) = text[start..].find(']') else {
+            return true;
+        };
+        let end = start + end_rel;
+        let segment = &text[start + 1..end];
+        if !is_supported_repeat_cq(segment) {
+            return true;
+        }
+        cursor = end + 1;
+    }
+    false
+}
+
+/// Returns true only for basic QQ face segments that can be safely echoed back.
+fn is_supported_repeat_cq(segment: &str) -> bool {
+    let Some(rest) = segment.strip_prefix("CQ:face,") else {
+        return false;
+    };
+
+    rest.split(',')
+        .find_map(|field| field.trim().strip_prefix("id="))
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .is_some()
 }
 
 /// Checks whether `keyword` occurs with both-side boundary constraints.

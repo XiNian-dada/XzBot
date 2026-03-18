@@ -79,6 +79,17 @@ pub struct CqImageRef {
     pub file: Option<String>,
 }
 
+/// Parsed file reference extracted from OneBot message segments.
+#[derive(Debug, Clone)]
+pub struct MessageFileRef {
+    pub name: Option<String>,
+    pub file_id: Option<String>,
+    pub file: Option<String>,
+    pub url: Option<String>,
+    pub busid: Option<i64>,
+    pub size: Option<u64>,
+}
+
 impl MessageEvent {
     /// Returns normalized text with image markers merged from segments and raw CQ message.
     pub fn text(&self) -> String {
@@ -94,6 +105,22 @@ impl MessageEvent {
             text.push_str(trimmed);
         }
         text
+    }
+
+    /// Returns normalized text produced only from original OneBot payload.
+    ///
+    /// 与 `text()` 的区别在于：这里不包含运行时补充的引用文本、解析后图片 URL、
+    /// 最近群聊摘录等附加上下文。
+    ///
+    /// 这个方法主要给“触发判定”使用：
+    /// - 是否需要响应群消息
+    /// - 是否命中插件命令
+    /// - 是否属于加一复读
+    ///
+    /// 换句话说，运行时补充出来的环境信息只应该帮助 AI 理解上下文，
+    /// 不应该反过来改变“这条消息本身是否触发机器人”。
+    pub fn original_text(&self) -> String {
+        self.base_text()
     }
 
     /// Returns normalized text produced only from original OneBot payload.
@@ -226,6 +253,75 @@ impl MessageEvent {
 
         out
     }
+
+    /// Returns deduplicated file references in current event.
+    pub fn file_refs(&self) -> Vec<MessageFileRef> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let MessagePayload::Segments(segments) = &self.message {
+            for segment in segments {
+                if segment.kind != "file" {
+                    continue;
+                }
+                let file_ref = file_ref_from_segment_data(&segment.data);
+                if let Some(file_ref) = dedup_file_ref(file_ref, &mut seen) {
+                    out.push(file_ref);
+                }
+            }
+        }
+
+        if let MessagePayload::Text(text) = &self.message {
+            for file_ref in extract_cq_file_refs(text) {
+                if let Some(file_ref) = dedup_file_ref(file_ref, &mut seen) {
+                    out.push(file_ref);
+                }
+            }
+        }
+
+        for file_ref in extract_cq_file_refs(&self.raw_message) {
+            if let Some(file_ref) = dedup_file_ref(file_ref, &mut seen) {
+                out.push(file_ref);
+            }
+        }
+
+        out
+    }
+
+    /// Returns deduplicated forward-message ids in current event.
+    pub fn forward_ids(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let MessagePayload::Segments(segments) = &self.message {
+            for segment in segments {
+                if segment.kind != "forward" {
+                    continue;
+                }
+                if let Some(id) = extract_string_like_value(segment.data.get("id")) {
+                    if seen.insert(id.clone()) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+
+        if let MessagePayload::Text(text) = &self.message {
+            for id in extract_cq_forward_ids(text) {
+                if seen.insert(id.clone()) {
+                    out.push(id);
+                }
+            }
+        }
+
+        for id in extract_cq_forward_ids(&self.raw_message) {
+            if seen.insert(id.clone()) {
+                out.push(id);
+            }
+        }
+
+        out
+    }
 }
 
 /// Converts segment array into normalized message text.
@@ -259,6 +355,16 @@ fn segments_to_text(segments: &[MessageSegment]) -> String {
                     .map(normalize_image_ref_value);
                 out.push_str(&image_ref_to_marker(&CqImageRef { url, file }));
             }
+            "face" => {
+                if let Some(id) = extract_i64_from_value(segment.data.get("id")) {
+                    out.push_str(&format!("[CQ:face,id={id}]"));
+                }
+            }
+            "file" => {
+                let file_ref = file_ref_from_segment_data(&segment.data);
+                out.push_str(&file_ref_to_marker(&file_ref));
+            }
+            "forward" => out.push_str("[转发消息]"),
             _ => {}
         }
     }
@@ -346,6 +452,101 @@ pub fn extract_cq_reply_ids(raw: &str) -> Vec<i64> {
     out
 }
 
+/// Extracts `[CQ:file,...]` references from raw message.
+pub fn extract_cq_file_refs(raw: &str) -> Vec<MessageFileRef> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(start_rel) = raw[cursor..].find("[CQ:file,") {
+        let start = cursor + start_rel;
+        let Some(end_rel) = raw[start..].find(']') else {
+            break;
+        };
+        let end = start + end_rel;
+        let segment = &raw[start + 1..end];
+
+        let mut file_ref = MessageFileRef {
+            name: None,
+            file_id: None,
+            file: None,
+            url: None,
+            busid: None,
+            size: None,
+        };
+
+        for field in segment.split(',') {
+            let field = field.trim();
+            if let Some(value) = field.strip_prefix("name=") {
+                let value = normalize_message_ref_value(value);
+                if !value.is_empty() {
+                    file_ref.name = Some(value);
+                }
+            }
+            if let Some(value) = field.strip_prefix("file_id=") {
+                let value = normalize_message_ref_value(value);
+                if !value.is_empty() {
+                    file_ref.file_id = Some(value);
+                }
+            }
+            if let Some(value) = field.strip_prefix("file=") {
+                let value = normalize_message_ref_value(value);
+                if !value.is_empty() {
+                    file_ref.file = Some(value);
+                }
+            }
+            if let Some(value) = field.strip_prefix("url=") {
+                let value = normalize_message_ref_value(value);
+                if !value.is_empty() {
+                    file_ref.url = Some(value);
+                }
+            }
+            if let Some(value) = field.strip_prefix("busid=") {
+                file_ref.busid = value.trim().parse::<i64>().ok();
+            }
+            if let Some(value) = field.strip_prefix("size=") {
+                file_ref.size = value.trim().parse::<u64>().ok();
+            }
+        }
+
+        if let Some(file_ref) = dedup_file_ref(file_ref, &mut seen) {
+            out.push(file_ref);
+        }
+        cursor = end + 1;
+    }
+
+    out
+}
+
+/// Extracts `[CQ:forward,id=...]` ids from raw message.
+pub fn extract_cq_forward_ids(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(start_rel) = raw[cursor..].find("[CQ:forward,") {
+        let start = cursor + start_rel;
+        let Some(end_rel) = raw[start..].find(']') else {
+            break;
+        };
+        let end = start + end_rel;
+        let segment = &raw[start + 1..end];
+
+        for field in segment.split(',') {
+            if let Some(id) = field.trim().strip_prefix("id=") {
+                let id = normalize_message_ref_value(id);
+                if !id.is_empty() && seen.insert(id.clone()) {
+                    out.push(id);
+                }
+            }
+        }
+
+        cursor = end + 1;
+    }
+
+    out
+}
+
 /// Encodes parsed image reference into normalized internal marker.
 fn image_ref_to_marker(image_ref: &CqImageRef) -> String {
     // 优先保留 url，避免同时携带 file 导致后续重复加载/无效 file 引用。
@@ -355,6 +556,17 @@ fn image_ref_to_marker(image_ref: &CqImageRef) -> String {
         (None, Some(file)) => format!("[IMAGE:file={file}]"),
         (None, None) => "[IMAGE]".to_string(),
     }
+}
+
+/// Encodes parsed file reference into a normalized internal marker.
+fn file_ref_to_marker(file_ref: &MessageFileRef) -> String {
+    let label = file_ref
+        .name
+        .as_deref()
+        .or(file_ref.file_id.as_deref())
+        .or(file_ref.file.as_deref())
+        .unwrap_or("unknown");
+    format!("[FILE:name={label}]")
 }
 
 /// Reads i64 from either numeric JSON or string JSON.
@@ -369,8 +581,31 @@ fn extract_i64_from_value(value: Option<&Value>) -> Option<i64> {
     None
 }
 
+/// Reads string-ish value from JSON numbers or strings.
+fn extract_string_like_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(v) = value.as_str() {
+        let v = normalize_message_ref_value(v);
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v.to_string());
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v.to_string());
+    }
+    None
+}
+
 /// Normalizes escaped/quoted image reference values from CQ fields.
 fn normalize_image_ref_value(value: &str) -> String {
+    normalize_message_ref_value(value)
+}
+
+/// Normalizes escaped/quoted CQ field values.
+fn normalize_message_ref_value(value: &str) -> String {
     value
         .trim()
         .trim_matches('"')
@@ -398,4 +633,67 @@ fn contains_image_ref_marker(text: &str, image_ref: &CqImageRef) -> bool {
         (None, Some(_)) => file_hit,
         (None, None) => false,
     }
+}
+
+/// Parses a structured `file` segment into a normalized file reference.
+fn file_ref_from_segment_data(data: &Value) -> MessageFileRef {
+    let name = data
+        .get("name")
+        .or_else(|| data.get("file_name"))
+        .and_then(Value::as_str)
+        .map(normalize_message_ref_value)
+        .filter(|v| !v.is_empty());
+    let file_id = data
+        .get("file_id")
+        .or_else(|| data.get("id"))
+        .and_then(Value::as_str)
+        .map(normalize_message_ref_value)
+        .filter(|v| !v.is_empty());
+    let file = data
+        .get("file")
+        .and_then(Value::as_str)
+        .map(normalize_message_ref_value)
+        .filter(|v| !v.is_empty());
+    let url = data
+        .get("url")
+        .and_then(Value::as_str)
+        .map(normalize_message_ref_value)
+        .filter(|v| !v.is_empty());
+    let busid = extract_i64_from_value(data.get("busid"));
+    let size = data
+        .get("size")
+        .or_else(|| data.get("file_size"))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|v| u64::try_from(v).ok()))
+                .or_else(|| value.as_str().and_then(|v| v.trim().parse::<u64>().ok()))
+        });
+
+    MessageFileRef {
+        name,
+        file_id,
+        file,
+        url,
+        busid,
+        size,
+    }
+}
+
+/// Deduplicates file refs by their strongest identity fields and drops empty refs.
+fn dedup_file_ref(
+    file_ref: MessageFileRef,
+    seen: &mut std::collections::HashSet<String>,
+) -> Option<MessageFileRef> {
+    let key = format!(
+        "{}|{}|{}|{}",
+        file_ref.name.clone().unwrap_or_default(),
+        file_ref.file_id.clone().unwrap_or_default(),
+        file_ref.file.clone().unwrap_or_default(),
+        file_ref.url.clone().unwrap_or_default()
+    );
+    if key == "|||" || !seen.insert(key) {
+        return None;
+    }
+    Some(file_ref)
 }
