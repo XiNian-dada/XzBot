@@ -2,9 +2,9 @@
 
 基于 **Rust + Tokio + Axum** 的 QQ 聊天机器人，通过 NapCat OneBot v11 反向 WebSocket 接入，支持多 LLM 后端、Function Call 工具调用与 OCR 图片识别。
 
-- 在线文档（GitHub Pages）：`https://xinian-dada.github.io/XzBot/`
+- 在线文档（GitHub Pages，多页面 Wiki）：`https://xinian-dada.github.io/XzBot/`
 - 仓库文档入口：`docs/index.html`
-- 当前 crate 版本：`0.2.0`
+- 当前 crate 版本：`0.2.1`
 
 ## 特性
 
@@ -35,7 +35,7 @@ cargo build --release
 
 默认监听 `0.0.0.0:3000`，WS 路径 `/onebot/v11/ws`。
 
-如果你更想看一份按“从零部署 -> 对接 NapCat -> 配置 -> 控制台 -> 升级发版”顺序整理的傻瓜文档，建议直接打开在线文档站：
+如果你更想看一份按“从零部署 -> 对接 NapCat -> 配置 -> 控制台 -> 插件 -> 升级发版”顺序整理的多页面傻瓜文档，建议直接打开在线文档站：
 
 - GitHub Pages：`https://xinian-dada.github.io/XzBot/`
 - 仓库内文件：`/Users/bernard/Code/XzBot/docs/index.html`

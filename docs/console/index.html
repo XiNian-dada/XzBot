@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>网页控制台 · XzBot Wiki</title>
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script defer src="../assets/site.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">XzBot Wiki</div>
+      <div class="version">版本 v0.2.1</div>
+      <div class="desc">当前页面：网页控制台</div>
+      <nav class="nav-group">
+        <a class="nav-link" href="../">首页</a>
+        <a class="nav-link" href="../getting-started/">从零部署</a>
+        <a class="nav-link" href="../napcat/">NapCat 对接</a>
+        <a class="nav-link" href="../configuration/">配置详解</a>
+        <a class="nav-link" href="./" data-nav="/XzBot/console/">网页控制台</a>
+        <a class="nav-link" href="../plugins/">插件系统</a>
+        <a class="nav-link" href="../release/">升级与发版</a>
+        <a class="nav-link" href="../faq/">常见问题</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <section class="panel">
+        <div class="breadcrumb">首页 / 网页控制台</div>
+        <div class="kicker">Web Console</div>
+        <h2>如果你觉得手改 TOML 麻烦，直接用这个面板</h2>
+        <h3>1. 怎么开启</h3>
+        <pre><code>[web_admin]
+enabled = true
+token = "请换成你自己的强随机 token"
+title = "XzBot Console"</code></pre>
+        <p>访问：</p>
+        <pre><code>http://你的服务器IP:3000/admin</code></pre>
+
+        <h3>2. 现在能做什么</h3>
+        <ul>
+          <li>查看当前 Provider / Model / WS 状态</li>
+          <li>编辑核心配置和覆盖文件</li>
+          <li>自动刷新的日志页</li>
+          <li>查看插件、命令、事件订阅、工具</li>
+          <li>在插件页用“文件管理器”方式编辑插件文本文件</li>
+          <li>保存并热重载</li>
+        </ul>
+
+        <h3>3. 哪些改动不能只靠热重载生效</h3>
+        <p>像下面这些监听配置，通常要重启进程才会完全生效：</p>
+        <ul>
+          <li><code>server.host</code></li>
+          <li><code>server.port</code></li>
+          <li><code>server.ws_path</code></li>
+        </ul>
+
+        <h3>4. 插件页为什么单独做文件管理器</h3>
+        <p>因为插件目录里不一定只有“配置文件”，还会有状态文件、缓存文件、输出文件。如果把它们全混到“配置页”里，就会很乱。现在插件文件已经被单独放到插件页处理了。</p>
+
+        <div class="callout warn">控制台仍然只是“磁盘文件的图形化入口”，没有引入第二套配置源。你在页面里保存，本质上还是写回原来的 TOML 或插件文本文件。</div>
+      </section>
+    </main>
+  </div>
+  <div class="footer">XzBot Wiki · 网页控制台</div>
+</body>
+</html>

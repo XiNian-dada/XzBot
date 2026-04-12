@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>从零部署 · XzBot Wiki</title>
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script defer src="../assets/site.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">XzBot Wiki</div>
+      <div class="version">版本 v0.2.1</div>
+      <div class="desc">当前页面：从零部署</div>
+      <div class="nav-title">开始使用</div>
+      <nav class="nav-group">
+        <a class="nav-link" href="../">首页</a>
+        <a class="nav-link" href="./" data-nav="/XzBot/getting-started/">从零部署</a>
+        <a class="nav-link" href="../napcat/" data-nav="/XzBot/napcat/">NapCat 对接</a>
+        <a class="nav-link" href="../configuration/" data-nav="/XzBot/configuration/">配置详解</a>
+        <a class="nav-link" href="../console/" data-nav="/XzBot/console/">网页控制台</a>
+        <a class="nav-link" href="../plugins/" data-nav="/XzBot/plugins/">插件系统</a>
+        <a class="nav-link" href="../release/" data-nav="/XzBot/release/">升级与发版</a>
+        <a class="nav-link" href="../faq/" data-nav="/XzBot/faq/">常见问题</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <section class="panel">
+        <div class="page-head">
+          <div>
+            <div class="breadcrumb">首页 / 从零部署</div>
+            <div class="kicker">Getting Started</div>
+            <h2>第一次部署 XzBot，照这页一步一步来</h2>
+          </div>
+          <div class="toc">
+            <strong>本页目录</strong>
+            <ul>
+              <li><a href="#need">你需要准备什么</a></li>
+              <li><a href="#build">如何编译</a></li>
+              <li><a href="#first-run">第一次运行会发生什么</a></li>
+              <li><a href="#minimum-config">最小可用配置</a></li>
+              <li><a href="#verify">怎么确认链路通了</a></li>
+            </ul>
+          </div>
+        </div>
+        <h3 id="need">1. 你需要准备什么</h3>
+        <ul>
+          <li>Rust stable 工具链</li>
+          <li>NapCat</li>
+          <li>一台能稳定运行机器人的机器</li>
+          <li>至少一个可用模型网关（先用 <code>mock</code> 也可以）</li>
+        </ul>
+        <blockquote>如果你现在只想先把链路打通，不要急着接真实模型。先用 <code>mock</code> 跑通，会省很多时间。</blockquote>
+
+        <h3 id="build">2. 如何编译</h3>
+        <pre><code>git clone https://github.com/XiNian-dada/XzBot.git
+cd XzBot
+cargo build --release</code></pre>
+        <p>编译完成后，主程序通常在：</p>
+        <pre><code>./target/release/xzbot</code></pre>
+
+        <h3 id="first-run">3. 第一次运行会发生什么</h3>
+        <pre><code>./target/release/xzbot</code></pre>
+        <p>首次运行时，它会在二进制所在目录自动生成：</p>
+        <pre><code>config/config.toml
+config/owner.toml
+config/server.toml
+config/policy.toml
+config/group.toml
+config/persona.toml
+config/ai.toml
+config/search.toml
+config/network.toml
+config/web_admin.toml</code></pre>
+        <p>这些覆盖文件默认是关闭的，也就是顶层会有：</p>
+        <pre><code>enabled = false</code></pre>
+
+        <h3 id="minimum-config">4. 最小可用配置</h3>
+        <p>只想先把机器人跑起来，先改主配置：</p>
+        <pre><code># config/config.toml
+[owner]
+qq = 你的QQ号
+
+[group]
+whitelist = [允许触发机器人的群号]
+trigger_mode = "at"
+
+[ai]
+provider = "mock"</code></pre>
+        <p>这样它先不会真正访问模型 API，但消息链路是可验证的。</p>
+
+        <h3 id="verify">5. 怎么确认链路通了</h3>
+        <ol>
+          <li>NapCat 配好反向 WebSocket 后，启动 XzBot。</li>
+          <li>看 XzBot 控制台里是否出现监听日志。</li>
+          <li>在白名单群里 <code>@机器人</code> 说一句最简单的话。</li>
+          <li>如果它有回应，就说明 OneBot → 路由 → 回复链路已经通了。</li>
+        </ol>
+        <div class="callout warn">如果出现 <code>Address in use</code>，说明旧进程还占着端口。先停旧进程，或者换 <code>server.port</code>。</div>
+        <p>下一步建议继续看：<a href="../napcat/">NapCat 对接</a>。</p>
+      </section>
+    </main>
+  </div>
+  <div class="footer">XzBot Wiki · 从零部署</div>
+</body>
+</html>

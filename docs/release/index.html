@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>升级与发版 · XzBot Wiki</title>
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script defer src="../assets/site.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">XzBot Wiki</div>
+      <div class="version">版本 v0.2.1</div>
+      <div class="desc">当前页面：升级与发版</div>
+      <nav class="nav-group">
+        <a class="nav-link" href="../">首页</a>
+        <a class="nav-link" href="../getting-started/">从零部署</a>
+        <a class="nav-link" href="../napcat/">NapCat 对接</a>
+        <a class="nav-link" href="../configuration/">配置详解</a>
+        <a class="nav-link" href="../console/">网页控制台</a>
+        <a class="nav-link" href="../plugins/">插件系统</a>
+        <a class="nav-link" href="./" data-nav="/XzBot/release/">升级与发版</a>
+        <a class="nav-link" href="../faq/">常见问题</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <section class="panel">
+        <div class="breadcrumb">首页 / 升级与发版</div>
+        <div class="kicker">Release & CI/CD</div>
+        <h2>版本号、Pages 和 Release 构建是怎么配合的</h2>
+
+        <h3>1. 现在有哪些自动化</h3>
+        <ul>
+          <li>推送到 <code>main</code>：触发 GitHub Pages 文档部署</li>
+          <li>推送 <code>v*</code> tag：触发 Release 构建工作流</li>
+        </ul>
+
+        <h3>2. 正确的发版顺序</h3>
+        <pre><code># 修改版本号
+# Cargo.toml -> version = "0.2.1"
+
+git add .
+git commit -m "release: v0.2.1"
+git push origin main
+
+git tag v0.2.1
+git push origin v0.2.1</code></pre>
+
+        <h3>3. 为什么你刚才看到 Release workflow 失败</h3>
+        <p>我本地已经复现过 <code>x86_64-unknown-linux-musl</code> 的 release 构建，当前代码本身是能过的。所以截图里那次更像是 GitHub Actions 侧的单点失败，而不是代码已经坏了。</p>
+        <p>我这次顺手把 workflow 改成了 <strong>矩阵失败不再直接全体取消</strong>，这样就算某一个目标出问题，其他目标还能继续构建，排查也更清楚。</p>
+
+        <h3>4. GitHub Pages 第一次启用要做什么</h3>
+        <ul>
+          <li>进入仓库 Settings → Pages</li>
+          <li>确认 Source 使用 <strong>GitHub Actions</strong></li>
+        </ul>
+        <div class="callout">文档站地址通常会是：<code>https://xinian-dada.github.io/XzBot/</code></div>
+      </section>
+    </main>
+  </div>
+  <div class="footer">XzBot Wiki · 升级与发版</div>
+</body>
+</html>

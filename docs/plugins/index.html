@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>插件系统 · XzBot Wiki</title>
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script defer src="../assets/site.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">XzBot Wiki</div>
+      <div class="version">版本 v0.2.1</div>
+      <div class="desc">当前页面：插件系统</div>
+      <nav class="nav-group">
+        <a class="nav-link" href="../">首页</a>
+        <a class="nav-link" href="../getting-started/">从零部署</a>
+        <a class="nav-link" href="../napcat/">NapCat 对接</a>
+        <a class="nav-link" href="../configuration/">配置详解</a>
+        <a class="nav-link" href="../console/">网页控制台</a>
+        <a class="nav-link" href="./" data-nav="/XzBot/plugins/">插件系统</a>
+        <a class="nav-link" href="../release/">升级与发版</a>
+        <a class="nav-link" href="../faq/">常见问题</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <section class="panel">
+        <div class="breadcrumb">首页 / 插件系统</div>
+        <div class="kicker">Plugin Host Platform</div>
+        <h2>后续新功能，尽量优先走插件</h2>
+        <p>现在 XzBot 的插件系统已经支持：</p>
+        <ul>
+          <li>命令型插件</li>
+          <li>事件型插件</li>
+          <li>AI 工具注册</li>
+          <li>多动作输出</li>
+          <li><code>stop_propagation</code> 阻断默认处理</li>
+        </ul>
+
+        <h3>1. 为什么推荐新功能做成插件</h3>
+        <ul>
+          <li>主程序职责更稳</li>
+          <li>业务功能出问题时边界更清楚</li>
+          <li>插件目录可以带自己的配置、状态和输出</li>
+        </ul>
+
+        <h3>2. 插件目录应该怎么放</h3>
+        <pre><code>Plugins/
+  XzPaper-plugin
+  XzPaper/
+    config.toml
+    state.json
+    output/
+      ...</code></pre>
+
+        <h3>3. 插件最常见的三种模式</h3>
+        <ol>
+          <li>命令插件：例如 <code>/analyze</code></li>
+          <li>事件插件：例如监听群消息、图片、引用、mention</li>
+          <li>工具插件：把自定义 function call 注册给 AI</li>
+        </ol>
+
+        <h3>4. 文档进一步看哪里</h3>
+        <p>如果你准备开始写插件，还建议一起看仓库里的原始开发文档：</p>
+        <pre><code>docs/PLUGINS.md</code></pre>
+      </section>
+    </main>
+  </div>
+  <div class="footer">XzBot Wiki · 插件系统</div>
+</body>
+</html>

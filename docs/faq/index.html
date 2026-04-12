@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>常见问题 · XzBot Wiki</title>
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script defer src="../assets/site.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">XzBot Wiki</div>
+      <div class="version">版本 v0.2.1</div>
+      <div class="desc">当前页面：常见问题</div>
+      <nav class="nav-group">
+        <a class="nav-link" href="../">首页</a>
+        <a class="nav-link" href="../getting-started/">从零部署</a>
+        <a class="nav-link" href="../napcat/">NapCat 对接</a>
+        <a class="nav-link" href="../configuration/">配置详解</a>
+        <a class="nav-link" href="../console/">网页控制台</a>
+        <a class="nav-link" href="../plugins/">插件系统</a>
+        <a class="nav-link" href="../release/">升级与发版</a>
+        <a class="nav-link" href="./" data-nav="/XzBot/faq/">常见问题</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <section class="panel">
+        <div class="breadcrumb">首页 / 常见问题</div>
+        <div class="kicker">FAQ</div>
+        <h2>最常卡住的地方，都在这了</h2>
+        <h3>1. 启动时报 <code>Address in use</code></h3>
+        <p>说明端口被旧进程占用。先停掉旧进程，或者换 <code>server.port</code>。</p>
+
+        <h3>2. NapCat 连不上 XzBot</h3>
+        <ul>
+          <li>先确认你开的是“WS 客户端 / 反向 WebSocket”</li>
+          <li>确认地址是 <code>ws://你的IP:端口/ws_path</code></li>
+          <li>如果开了 token 校验，确认两边 token 完全一致</li>
+        </ul>
+
+        <h3>3. 群里发了上一条消息，Bot 却说看不到</h3>
+        <p>现在最近群聊上下文已经改成了按需工具查询，效果比以前稳，但如果你想让它百分百理解某条具体消息，最稳的方式还是：<strong>直接引用那条消息</strong>。</p>
+
+        <h3>4. 控制台打不开</h3>
+        <ul>
+          <li>确认 <code>[web_admin].enabled = true</code></li>
+          <li>确认你访问的是当前机器人监听的端口</li>
+          <li>确认你运行的是带控制台代码的新二进制</li>
+        </ul>
+
+        <h3>5. 某些模型网关 curl 能回，Bot 却报空内容</h3>
+        <p>这通常是兼容网关要求 <code>stream=true</code>，可以试：</p>
+        <pre><code>[ai]
+wire_api = "chat_completions"
+stream_chat_completions = true</code></pre>
+      </section>
+    </main>
+  </div>
+  <div class="footer">XzBot Wiki · 常见问题</div>
+</body>
+</html>

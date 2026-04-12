@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NapCat 对接 · XzBot Wiki</title>
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script defer src="../assets/site.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">XzBot Wiki</div>
+      <div class="version">版本 v0.2.1</div>
+      <div class="desc">当前页面：NapCat 对接</div>
+      <nav class="nav-group">
+        <a class="nav-link" href="../">首页</a>
+        <a class="nav-link" href="../getting-started/">从零部署</a>
+        <a class="nav-link" href="./" data-nav="/XzBot/napcat/">NapCat 对接</a>
+        <a class="nav-link" href="../configuration/">配置详解</a>
+        <a class="nav-link" href="../console/">网页控制台</a>
+        <a class="nav-link" href="../plugins/">插件系统</a>
+        <a class="nav-link" href="../release/">升级与发版</a>
+        <a class="nav-link" href="../faq/">常见问题</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <section class="panel">
+        <div class="breadcrumb">首页 / NapCat 对接</div>
+        <div class="kicker">OneBot v11 Reverse WS</div>
+        <h2>NapCat 应该怎么接到 XzBot</h2>
+        <p>这个项目只依赖 NapCat 的 <strong>OneBot v11 反向 WebSocket（WS 客户端）</strong>。也就是说：NapCat 主动连 XzBot，XzBot 自己监听。</p>
+
+        <h3>1. NapCat 里应该开哪一个</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>能力</th><th>要不要开</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td>OneBot v11</td><td>必须开</td><td>这是协议基础。</td></tr>
+              <tr><td>WS 客户端 / 反向 WS</td><td>必须开</td><td>XzBot 标准接入方式。</td></tr>
+              <tr><td>WS 服务端</td><td>通常不用</td><td>除非你还有别的系统依赖它。</td></tr>
+              <tr><td>HTTP 上报</td><td>通常不用</td><td>XzBot 不依赖它。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>2. 地址怎么填</h3>
+        <pre><code>ws://你的服务器IP:3000/onebot/v11/ws</code></pre>
+        <p>其中：</p>
+        <ul>
+          <li><code>3000</code> 来自 <code>[server].port</code></li>
+          <li><code>/onebot/v11/ws</code> 来自 <code>[server].ws_path</code></li>
+        </ul>
+
+        <h3>3. 如果开了 token 校验怎么办</h3>
+        <p>如果你把：</p>
+        <pre><code>[server]
+verify_token = true
+access_token = "你的token"</code></pre>
+        <p>那 NapCat 里也要把同一个 token 配进去，不然连接会被拒绝。</p>
+
+        <h3>4. 最稳的排查顺序</h3>
+        <ol>
+          <li>先确认 NapCat 的反向 WS 已经启用。</li>
+          <li>确认连接地址是你当前 XzBot 真正在监听的地址。</li>
+          <li>确认本机 / 服务器防火墙没有拦截端口。</li>
+          <li>如果开了 token，确认两边 token 一模一样。</li>
+        </ol>
+
+        <div class="callout">如果你已经能看到 XzBot 控制台里有新的群消息事件进来，那 NapCat 这一层基本就通了。</div>
+      </section>
+    </main>
+  </div>
+  <div class="footer">XzBot Wiki · NapCat 对接</div>
+</body>
+</html>

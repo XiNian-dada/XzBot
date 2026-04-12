@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>配置详解 · XzBot Wiki</title>
+  <link rel="stylesheet" href="../assets/site.css" />
+  <script defer src="../assets/site.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">XzBot Wiki</div>
+      <div class="version">版本 v0.2.1</div>
+      <div class="desc">当前页面：配置详解</div>
+      <nav class="nav-group">
+        <a class="nav-link" href="../">首页</a>
+        <a class="nav-link" href="../getting-started/">从零部署</a>
+        <a class="nav-link" href="../napcat/">NapCat 对接</a>
+        <a class="nav-link" href="./" data-nav="/XzBot/configuration/">配置详解</a>
+        <a class="nav-link" href="../console/">网页控制台</a>
+        <a class="nav-link" href="../plugins/">插件系统</a>
+        <a class="nav-link" href="../release/">升级与发版</a>
+        <a class="nav-link" href="../faq/">常见问题</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <section class="panel">
+        <div class="page-head">
+          <div>
+            <div class="breadcrumb">首页 / 配置详解</div>
+            <div class="kicker">Config</div>
+            <h2>主配置 + 可选覆盖文件，应该怎么理解</h2>
+          </div>
+          <div class="toc">
+            <strong>本页目录</strong>
+            <ul>
+              <li><a href="#main">主配置和覆盖文件</a></li>
+              <li><a href="#ai">AI 与模型接入</a></li>
+              <li><a href="#search">搜索与抓取</a></li>
+              <li><a href="#ocr">OCR 与图片</a></li>
+              <li><a href="#network">代理</a></li>
+              <li><a href="#web-admin">网页控制台配置</a></li>
+            </ul>
+          </div>
+        </div>
+
+        <h3 id="main">1. 主配置和覆盖文件</h3>
+        <p>最推荐的使用姿势是：</p>
+        <ul>
+          <li>先只改 <code>config/config.toml</code></li>
+          <li>某一块变长了，再拆到 <code>persona.toml</code> / <code>ai.toml</code> / <code>network.toml</code></li>
+          <li>拆出去的覆盖文件顶层要改成 <code>enabled = true</code></li>
+        </ul>
+        <pre><code># config/persona.toml
+enabled = true
+
+[persona]
+system = """
+这里放长人设
+"""</code></pre>
+
+        <h3 id="ai">2. AI 与模型接入</h3>
+        <p>常见的几种配法：</p>
+        <pre><code>[ai]
+provider = "openai_compatible"
+base_url = "https://your-gateway.example/v1"
+api_key = "sk-xxx"
+model = "gpt-5.4"
+fallback_models = ["gpt-4.1", "gpt-4o-mini"]</code></pre>
+        <p>如果你的网关走 <code>/responses</code>：</p>
+        <pre><code>[ai]
+wire_api = "responses"</code></pre>
+        <p>如果你的网关在 <code>chat/completions</code> 下必须 <code>stream=true</code> 才正常返回正文：</p>
+        <pre><code>[ai]
+wire_api = "chat_completions"
+stream_chat_completions = true</code></pre>
+
+        <h3 id="search">3. 搜索与抓取</h3>
+        <pre><code>[search]
+provider = "builtin"   # 或 "searxng"
+searxng_url = ""</code></pre>
+        <p>如果你启用了 SearXNG，就会优先走你自己的搜索实例。知乎链接则会优先构造公开 API，而不是硬撞网页壳页面。</p>
+
+        <h3 id="ocr">4. OCR 与图片</h3>
+        <p>多模态模型会直接看图，纯文本模型才会退回 OCR。支持本地 Tesseract 或 Paddle OCR：</p>
+        <pre><code>[ai]
+vision_mode = "auto"
+ocr_provider = "tesseract"
+ocr_cmd = "tesseract"
+ocr_lang = "chi_sim+eng"</code></pre>
+
+        <h3 id="network">5. 代理</h3>
+        <pre><code>[network]
+proxy_enabled = true
+proxy_url = "socks5://127.0.0.1:10808"
+proxy_test_url = "https://www.google.com"
+proxy_timeout_ms = 10000</code></pre>
+        <p>如果只想让 Paddle OCR 直连，可以把 <code>paddle_use_proxy = false</code>。</p>
+
+        <h3 id="web-admin">6. 网页控制台配置</h3>
+        <pre><code>[web_admin]
+enabled = true
+token = "请换成强随机 token"
+title = "XzBot Console"</code></pre>
+        <div class="callout">现在控制台已经支持：核心配置编辑、日志查看、插件概览、插件文件管理器、保存后热重载。</div>
+      </section>
+    </main>
+  </div>
+  <div class="footer">XzBot Wiki · 配置详解</div>
+</body>
+</html>
