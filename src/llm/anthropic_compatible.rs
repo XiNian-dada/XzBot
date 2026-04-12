@@ -42,6 +42,11 @@ pub struct AnthropicCompatibleLlm {
     ocr_settings: OcrSettings,
 }
 
+struct ToolExecutionResult {
+    text: String,
+    followup_user_message: Option<Value>,
+}
+
 impl AnthropicCompatibleLlm {
     /// Builds provider client/runtime settings from global AI config.
     pub fn from_config(
@@ -322,19 +327,24 @@ impl AnthropicCompatibleLlm {
             }));
 
             let mut tool_result_blocks = Vec::new();
+            let mut followup_messages = Vec::new();
             for call in tool_calls {
                 let result = self.execute_tool_call(&session_id, &call).await;
                 tool_result_blocks.push(json!({
                     "type": "tool_result",
                     "tool_use_id": call.id,
-                    "content": result
+                    "content": result.text
                 }));
+                if let Some(followup) = result.followup_user_message {
+                    followup_messages.push(followup);
+                }
             }
 
             messages.push(json!({
                 "role": "user",
                 "content": tool_result_blocks
             }));
+            messages.extend(followup_messages);
         }
 
         bail!("tool call rounds exceeded")
@@ -489,6 +499,64 @@ impl AnthropicCompatibleLlm {
         text
     }
 
+    async fn build_recent_group_context_tool_result(
+        &self,
+        group_id: i64,
+        limit: usize,
+    ) -> ToolExecutionResult {
+        let Some(context) = self.store.recent_group_context(group_id, limit, 8_000) else {
+            return ToolExecutionResult {
+                text: "当前没有可用的最近群聊上下文。".to_string(),
+                followup_user_message: None,
+            };
+        };
+
+        let parsed = parse_user_content(&context);
+        let has_images = !parsed.image_urls.is_empty() || !parsed.image_files.is_empty();
+        if !has_images {
+            return ToolExecutionResult {
+                text: context,
+                followup_user_message: None,
+            };
+        }
+
+        if self.should_send_images() {
+            let blocks = self
+                .build_anthropic_user_blocks(ParsedUserContent {
+                    text: "以下图片来自最近群聊，仅作为上下文补充，不是新的用户提问。请结合这些图片理解群里刚刚发的内容。".to_string(),
+                    image_urls: parsed.image_urls.clone(),
+                    image_files: parsed.image_files.clone(),
+                })
+                .await;
+            return ToolExecutionResult {
+                text: context,
+                followup_user_message: Some(json!({
+                    "role": "user",
+                    "content": blocks,
+                })),
+            };
+        }
+
+        if self.should_use_ocr() {
+            let ocr_text = self
+                .build_user_text_with_ocr(ParsedUserContent {
+                    text: String::new(),
+                    image_urls: parsed.image_urls,
+                    image_files: parsed.image_files,
+                })
+                .await;
+            return ToolExecutionResult {
+                text: append_recent_group_image_note(context, &ocr_text),
+                followup_user_message: None,
+            };
+        }
+
+        ToolExecutionResult {
+            text: context,
+            followup_user_message: None,
+        }
+    }
+
     fn should_send_images(&self) -> bool {
         match self.vision_mode {
             VisionMode::Multimodal => true,
@@ -505,8 +573,8 @@ impl AnthropicCompatibleLlm {
         }
     }
 
-    async fn execute_tool_call(&self, session_id: &str, call: &ToolCall) -> String {
-        match call.name.as_str() {
+    async fn execute_tool_call(&self, session_id: &str, call: &ToolCall) -> ToolExecutionResult {
+        let text = match call.name.as_str() {
             "search_web" => {
                 let query = call
                     .input
@@ -516,11 +584,14 @@ impl AnthropicCompatibleLlm {
                     .trim()
                     .to_string();
                 if query.is_empty() {
-                    return tool_error_with_hint(
-                        "search_web",
-                        "query is empty",
-                        "提供更具体的关键词；如果用户已经给了网页链接，改用 fetch_url。",
-                    );
+                    return ToolExecutionResult {
+                        text: tool_error_with_hint(
+                            "search_web",
+                            "query is empty",
+                            "提供更具体的关键词；如果用户已经给了网页链接，改用 fetch_url。",
+                        ),
+                        followup_user_message: None,
+                    };
                 }
                 match search_web(
                     &self.client,
@@ -548,11 +619,14 @@ impl AnthropicCompatibleLlm {
                     .trim()
                     .to_string();
                 if url.is_empty() {
-                    return tool_error_with_hint(
-                        "fetch_url",
-                        "url is empty",
-                        "直接提供完整链接；如果现在只有主题没有链接，先用 search_web。",
-                    );
+                    return ToolExecutionResult {
+                        text: tool_error_with_hint(
+                            "fetch_url",
+                            "url is empty",
+                            "直接提供完整链接；如果现在只有主题没有链接，先用 search_web。",
+                        ),
+                        followup_user_message: None,
+                    };
                 }
                 match fetch_url(&self.client, &url, self.debug, &self.network).await {
                     Ok(v) => wrap_untrusted_tool_output("fetch_url", v),
@@ -592,11 +666,14 @@ impl AnthropicCompatibleLlm {
                     .trim()
                     .to_string();
                 if location.is_empty() {
-                    return tool_error_with_hint(
-                        "get_weather",
-                        "location is empty",
-                        "提供更具体的地点；如果需要未来多天预报，优先改用 search_web。",
-                    );
+                    return ToolExecutionResult {
+                        text: tool_error_with_hint(
+                            "get_weather",
+                            "location is empty",
+                            "提供更具体的地点；如果需要未来多天预报，优先改用 search_web。",
+                        ),
+                        followup_user_message: None,
+                    };
                 }
                 match get_weather(&self.client, &location, self.debug).await {
                     Ok(v) => wrap_untrusted_tool_output("get_weather", v),
@@ -615,19 +692,20 @@ impl AnthropicCompatibleLlm {
                     .unwrap_or(10)
                     .clamp(1, 10) as usize;
                 let Some(group_id) = session_group_id(session_id) else {
-                    return tool_error_with_hint(
-                        "get_recent_group_context",
-                        "current session is not a group chat",
-                        "只能在群聊会话里查询最近群聊上下文。",
-                    );
+                    return ToolExecutionResult {
+                        text: tool_error_with_hint(
+                            "get_recent_group_context",
+                            "current session is not a group chat",
+                            "只能在群聊会话里查询最近群聊上下文。",
+                        ),
+                        followup_user_message: None,
+                    };
                 };
-                match self.store.recent_group_context(group_id, limit, 8_000) {
-                    Some(v) => wrap_untrusted_tool_output("get_recent_group_context", v),
-                    None => wrap_untrusted_tool_output(
-                        "get_recent_group_context",
-                        "当前没有可用的最近群聊上下文。".to_string(),
-                    ),
-                }
+                let mut result = self
+                    .build_recent_group_context_tool_result(group_id, limit)
+                    .await;
+                result.text = wrap_untrusted_tool_output("get_recent_group_context", result.text);
+                return result;
             }
             _ => match self.plugins.call_tool(&call.name, call.input.clone()).await {
                 Ok(Some(v)) => wrap_untrusted_tool_output(&call.name, v),
@@ -638,6 +716,11 @@ impl AnthropicCompatibleLlm {
                     "检查参数是否完整，或换用别的内置工具/插件工具。",
                 ),
             },
+        };
+
+        ToolExecutionResult {
+            text,
+            followup_user_message: None,
         }
     }
 }
@@ -710,6 +793,31 @@ fn model_seems_multimodal(model: &str) -> bool {
         "cogvlm",
     ];
     keywords.iter().any(|k| m.contains(k))
+}
+
+fn append_recent_group_image_note(mut context: String, ocr_text: &str) -> String {
+    let trimmed = ocr_text.trim();
+    if trimmed.is_empty() {
+        return context;
+    }
+    if !context.is_empty() {
+        context.push_str("\n\n");
+    }
+    context.push_str("[最近群聊图片补充]\n");
+    context.push_str(&truncate_recent_group_note(trimmed, 4_000));
+    context
+}
+
+fn truncate_recent_group_note(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...(truncated)");
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn sanitize_untrusted_tool_text(content: &str) -> String {

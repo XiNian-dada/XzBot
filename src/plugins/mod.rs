@@ -52,6 +52,18 @@ pub struct PluginToolDefinition {
     pub input_schema: Value,
 }
 
+/// 提供给控制面板/诊断接口的插件摘要。
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginSummary {
+    pub name: String,
+    pub path: String,
+    pub commands: Vec<String>,
+    pub subscriptions: Vec<String>,
+    pub tool_names: Vec<String>,
+    pub timeout_ms: u64,
+    pub priority: i32,
+}
+
 /// 事件分发结果：既包含插件生成的动作，也标记是否要阻断后续 AI/插件传播。
 #[derive(Debug, Default)]
 pub struct PluginDispatchOutcome {
@@ -165,6 +177,26 @@ impl PluginManager {
         self.active_tool_definitions()
             .into_iter()
             .map(|tool| tool.name)
+            .collect()
+    }
+
+    /// Returns detailed plugin summaries for admin UI / diagnostics.
+    pub fn summaries(&self) -> Vec<PluginSummary> {
+        self.plugins
+            .iter()
+            .map(|plugin| PluginSummary {
+                name: plugin.name.clone(),
+                path: plugin.path.to_string_lossy().to_string(),
+                commands: plugin.commands.clone(),
+                subscriptions: {
+                    let mut items = plugin.subscriptions.iter().cloned().collect::<Vec<_>>();
+                    items.sort();
+                    items
+                },
+                tool_names: plugin.tools.iter().map(|tool| tool.name.clone()).collect(),
+                timeout_ms: plugin.timeout_ms,
+                priority: plugin.priority,
+            })
             .collect()
     }
 
@@ -441,6 +473,7 @@ impl ManagedPlugin {
             raw_text: ctx.normalized_text.clone(),
             text: ctx.text.clone(),
             message_type: ctx.message_type.clone(),
+            message_id: ctx.message_id,
             user_id: ctx.user_id,
             group_id: ctx.group_id,
             self_id: ctx.self_id,
@@ -451,6 +484,8 @@ impl ManagedPlugin {
             image_urls: ctx.image_urls.clone(),
             image_files: ctx.image_files.clone(),
             reply_message_ids: ctx.reply_message_ids.clone(),
+            quote_texts: ctx.quote_texts.clone(),
+            forward_contexts: ctx.forward_contexts.clone(),
             tool_name: None,
             tool_arguments: None,
             config_dir: self.config_dir.to_string_lossy().to_string(),
@@ -467,6 +502,7 @@ impl ManagedPlugin {
             raw_text: ctx.raw_text.clone(),
             text: ctx.text.clone(),
             message_type: ctx.message_type.clone(),
+            message_id: ctx.message_id,
             user_id: ctx.user_id,
             group_id: ctx.group_id,
             self_id: ctx.self_id,
@@ -477,6 +513,8 @@ impl ManagedPlugin {
             image_urls: ctx.image_urls.clone(),
             image_files: ctx.image_files.clone(),
             reply_message_ids: ctx.reply_message_ids.clone(),
+            quote_texts: ctx.quote_texts.clone(),
+            forward_contexts: ctx.forward_contexts.clone(),
             tool_name: None,
             tool_arguments: None,
             config_dir: self.config_dir.to_string_lossy().to_string(),
@@ -493,6 +531,7 @@ impl ManagedPlugin {
             raw_text: String::new(),
             text: String::new(),
             message_type: String::new(),
+            message_id: None,
             user_id: 0,
             group_id: None,
             self_id: 0,
@@ -503,6 +542,8 @@ impl ManagedPlugin {
             image_urls: Vec::new(),
             image_files: Vec::new(),
             reply_message_ids: Vec::new(),
+            quote_texts: Vec::new(),
+            forward_contexts: Vec::new(),
             tool_name: Some(tool_name),
             tool_arguments: Some(tool_arguments),
             config_dir: self.config_dir.to_string_lossy().to_string(),
@@ -583,6 +624,7 @@ struct PluginRequest {
     raw_text: String,
     text: String,
     message_type: String,
+    message_id: Option<i64>,
     user_id: i64,
     group_id: Option<i64>,
     self_id: i64,
@@ -593,6 +635,8 @@ struct PluginRequest {
     image_urls: Vec<String>,
     image_files: Vec<String>,
     reply_message_ids: Vec<i64>,
+    quote_texts: Vec<String>,
+    forward_contexts: Vec<String>,
     tool_name: Option<String>,
     tool_arguments: Option<Value>,
     config_dir: String,
@@ -688,6 +732,7 @@ struct PluginMessageContext {
     normalized_text: String,
     text: String,
     message_type: String,
+    message_id: Option<i64>,
     user_id: i64,
     group_id: Option<i64>,
     self_id: i64,
@@ -698,6 +743,8 @@ struct PluginMessageContext {
     image_urls: Vec<String>,
     image_files: Vec<String>,
     reply_message_ids: Vec<i64>,
+    quote_texts: Vec<String>,
+    forward_contexts: Vec<String>,
 }
 
 impl PluginMessageContext {
@@ -712,9 +759,13 @@ impl PluginMessageContext {
         let at_me = format!("[CQ:at,qq={}]", event.self_id);
         let mentioned = raw_text.contains(&at_me);
         let normalized_text = raw_text.replace(&at_me, "").trim().to_string();
-        let parsed = parse_user_content(&normalized_text);
+        let parsed_raw = parse_user_content(&normalized_text);
+        let parsed_full = parse_user_content(&event.text());
         let reply_message_ids = event.reply_message_ids();
         let is_owner = event.user_id == owner_qq;
+        let message_id = extract_i64_from_value(event.message_id.as_ref());
+        let quote_texts = collect_enriched_parts(&event.enriched_parts, "[引用消息]");
+        let forward_contexts = collect_enriched_parts(&event.enriched_parts, "[转发消息");
 
         let mut event_types = vec!["message".to_string()];
         match event.message_type.as_str() {
@@ -726,7 +777,7 @@ impl PluginMessageContext {
         if mentioned {
             event_types.push("mention".to_string());
         }
-        if !parsed.image_urls.is_empty() || !parsed.image_files.is_empty() {
+        if !parsed_full.image_urls.is_empty() || !parsed_full.image_files.is_empty() {
             event_types.push("image".to_string());
         }
         if !reply_message_ids.is_empty() {
@@ -742,10 +793,11 @@ impl PluginMessageContext {
         Self {
             raw_text,
             normalized_text,
-            // 插件正文保留完整富化文本，这样事件插件仍然能看到引用/文件/转发等扩展上下文。
-            // 但前面的命中与分类逻辑已经固定为原始消息，不会再被“最近群聊”误触发。
-            text: event.text(),
+            // 这里的正文只保留“当前消息本身”的可读文本；
+            // 引用/转发/图片额外上下文通过独立字段继续提供给插件，避免一锅炖导致插件重复解析。
+            text: parsed_raw.text,
             message_type: event.message_type.clone(),
+            message_id,
             user_id: event.user_id,
             group_id: event.group_id,
             self_id: event.self_id,
@@ -753,11 +805,50 @@ impl PluginMessageContext {
             mentioned,
             is_owner,
             event_types,
-            image_urls: parsed.image_urls,
-            image_files: parsed.image_files,
+            image_urls: merge_unique_strings(parsed_raw.image_urls, parsed_full.image_urls),
+            image_files: merge_unique_strings(parsed_raw.image_files, parsed_full.image_files),
             reply_message_ids,
+            quote_texts,
+            forward_contexts,
         }
     }
+}
+
+fn merge_unique_strings(primary: Vec<String>, secondary: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in primary.into_iter().chain(secondary.into_iter()) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+fn collect_enriched_parts(parts: &[String], prefix: &str) -> Vec<String> {
+    parts
+        .iter()
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.starts_with(prefix) {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn extract_i64_from_value(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
 }
 
 /// Ensures plugin process is running, restarting when exited.

@@ -399,7 +399,7 @@ fn parse_post_token_command(event: &MessageEvent, owner_qq: i64) -> Option<PostT
 /// - 基于新配置构建出的 router / LLM / AI 插件
 ///
 /// 旧插件会在新运行时切换成功后主动关闭，避免出现“新旧插件并存”。
-async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
+pub(super) async fn reload_runtime(state: &AppState) -> anyhow::Result<ReloadOutcome> {
     let config_path = state.config_path.as_ref();
     let new_config = Arc::new(Config::load(config_path)?);
     let plugin_root = std::env::current_dir()?.join("Plugins");

@@ -1,5 +1,19 @@
 //! 二进制入口：仅负责声明模块并启动应用运行时。
 
+#[allow(unused_macros)]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        $crate::logger::print_stdout_line(format!($($arg)*));
+    }};
+}
+
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        $crate::logger::print_stderr_line(format!($($arg)*));
+    }};
+}
+
 mod app;
 mod bot;
 mod config;

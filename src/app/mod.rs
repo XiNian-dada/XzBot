@@ -59,9 +59,11 @@ use crate::{
 };
 
 mod admin;
+mod console;
 mod enrich;
 
 use admin::*;
+use console::*;
 use enrich::*;
 
 // ===== 运行时共享状态与协议桥接 =====
@@ -213,6 +215,14 @@ pub async fn run() -> anyhow::Result<()> {
     let app = Router::new()
         .route(ws_path.as_str(), get(onebot_ws_handler))
         .route("/api/post/send", post(post_send_handler))
+        .route("/admin", get(admin_console_page))
+        .route("/api/admin/login", post(admin_login_handler))
+        .route("/api/admin/logout", post(admin_logout_handler))
+        .route("/api/admin/bootstrap", get(admin_bootstrap_handler))
+        .route("/api/admin/config/save", post(admin_save_config_handler))
+        .route("/api/admin/plugin-file", get(admin_plugin_file_handler))
+        .route("/api/admin/reload", post(admin_reload_handler))
+        .route("/api/admin/logs", get(admin_logs_handler))
         .with_state(AppState {
             runtime,
             config_path: Arc::new(config_path.clone()),
@@ -726,6 +736,29 @@ async fn process_incoming(
         return serialize_actions(actions);
     }
 
+    let recent_group_cache = if event.message_type == "group" && event.user_id != event.self_id {
+        event.group_id.map(|group_id| {
+            (
+                group_id,
+                event.recent_context_cache_key(),
+                router.should_defer_recent_group_cache(&event),
+            )
+        })
+    } else {
+        None
+    };
+
+    // 不会触发当前轮处理的普通群消息，先快速写一条“基础版最近群聊”。
+    // 这样别人才刚发完图、下一秒有人 @Bot 问“这是什么意思”时，
+    // 不会因为前一条消息还在慢富化而直接漏掉。
+    if let Some((group_id, cache_key, false)) = recent_group_cache.as_ref() {
+        if let Some(entry) = build_recent_group_entry_from_text(&event, event.original_text()) {
+            state
+                .store
+                .push_recent_group_message(*group_id, cache_key.clone(), entry);
+        }
+    }
+
     // 进度提示必须早于慢富化，否则用户看到的顺序会变成“先抓网页，再说我去查”。
     let _progress_session = router
         .maybe_start_progress_session(&event, Some(action_tx.clone()))
@@ -736,13 +769,9 @@ async fn process_incoming(
         log_warn_err("failed to enrich image context", &err);
     }
 
-    let recent_group_push = if event.message_type == "group" && event.user_id != event.self_id {
-        event
-            .group_id
-            .and_then(|group_id| build_recent_group_entry(&event).map(|entry| (group_id, entry)))
-    } else {
-        None
-    };
+    let recent_group_push = recent_group_cache.and_then(|(group_id, cache_key, _)| {
+        build_recent_group_entry(&event).map(|entry| (group_id, cache_key, entry))
+    });
 
     let actions = match router.route_message(event).await {
         Ok(action) => action,
@@ -753,8 +782,10 @@ async fn process_incoming(
     };
 
     // 最近群聊上下文改成按需工具查询，所以这里只把当前消息写进缓存，不再注入当前轮 prompt。
-    if let Some((group_id, entry)) = recent_group_push {
-        state.store.push_recent_group_message(group_id, entry);
+    if let Some((group_id, cache_key, entry)) = recent_group_push {
+        state
+            .store
+            .push_recent_group_message(group_id, cache_key, entry);
     }
 
     serialize_actions(actions)
@@ -813,20 +844,35 @@ fn serialize_actions(actions: Vec<ActionRequest>) -> Vec<String> {
 
 /// Builds one summarized current-group-message entry for the rolling recent-message buffer.
 fn build_recent_group_entry(event: &MessageEvent) -> Option<String> {
+    build_recent_group_entry_from_text(event, event.text())
+}
+
+/// Builds one rolling recent-group entry from already chosen text source.
+///
+/// 这里统一把“当前提问者”和“最近群聊历史发言者”格式拉开：
+/// - 最近群聊缓存明确标注成历史消息
+/// - 发送者姓名和 QQ 号都保留
+///
+/// 这样模型在群共享上下文里更不容易把“刚刚那个人说的话”和“当前提问者”
+/// 混成同一个人。
+fn build_recent_group_entry_from_text(event: &MessageEvent, source_text: String) -> Option<String> {
     if event.message_type != "group" {
         return None;
     }
 
-    let text = trim_for_recent_context(event.text().trim(), RECENT_GROUP_MESSAGE_MAX_CHARS);
+    let text = trim_for_recent_context(source_text.trim(), RECENT_GROUP_MESSAGE_MAX_CHARS);
     if text.is_empty() {
         return None;
     }
 
     let display_name = event.display_name();
     if display_name == event.user_id.to_string() {
-        Some(format!("[{}] {}", event.user_id, text))
+        Some(format!("[最近群聊][群成员 {}] {}", event.user_id, text))
     } else {
-        Some(format!("[{}({})] {}", display_name, event.user_id, text))
+        Some(format!(
+            "[最近群聊][群成员 {}({})] {}",
+            display_name, event.user_id, text
+        ))
     }
 }
 

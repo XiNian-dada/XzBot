@@ -2,6 +2,12 @@
 
 use dashmap::DashMap;
 
+#[derive(Debug, Clone)]
+struct RecentGroupMessage {
+    key: String,
+    content: String,
+}
+
 /// Stable key used to isolate conversation context by chat scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey {
@@ -37,7 +43,7 @@ pub struct MemoryStore {
     // 保存 (role, content)，并在写入时裁剪到最近 10 轮（20 条消息）。
     sessions: DashMap<SessionKey, Vec<(String, String)>>,
     // 保存每个群最近的原始聊天摘录，供被 @ 时补作“群内最近发生了什么”的环境上下文。
-    recent_group_messages: DashMap<i64, Vec<String>>,
+    recent_group_messages: DashMap<i64, Vec<RecentGroupMessage>>,
 }
 
 impl MemoryStore {
@@ -52,6 +58,11 @@ impl MemoryStore {
     /// Clears the full conversation context for one session.
     pub fn reset(&self, key: &SessionKey) {
         self.sessions.remove(key);
+    }
+
+    /// Clears rolling recent-message cache for one group.
+    pub fn clear_recent_group_messages(&self, group_id: i64) {
+        self.recent_group_messages.remove(&group_id);
     }
 
     /// Appends one user message and returns the updated history snapshot.
@@ -108,9 +119,18 @@ impl MemoryStore {
     /// 这条缓冲区和 AI 对话历史不同：
     /// - 它保存的是“群里最近说过什么”
     /// - 目的是让机器人在被 @ 时，能看到刚刚几条并非直接对它说的话
-    pub fn push_recent_group_message(&self, group_id: i64, content: String) {
+    pub fn push_recent_group_message(
+        &self,
+        group_id: i64,
+        key: impl Into<String>,
+        content: String,
+    ) {
         let trimmed = content.trim();
         if trimmed.is_empty() {
+            return;
+        }
+        let key = key.into();
+        if key.trim().is_empty() {
             return;
         }
 
@@ -118,7 +138,16 @@ impl MemoryStore {
             .recent_group_messages
             .entry(group_id)
             .or_insert_with(Vec::new);
-        entry.push(trimmed.to_string());
+
+        if let Some(existing) = entry.iter_mut().find(|item| item.key == key) {
+            existing.content = trimmed.to_string();
+            return;
+        }
+
+        entry.push(RecentGroupMessage {
+            key,
+            content: trimmed.to_string(),
+        });
 
         if entry.len() > 30 {
             let overflow = entry.len() - 30;
@@ -133,7 +162,10 @@ impl MemoryStore {
             .map(|entry| {
                 let len = entry.len();
                 let start = len.saturating_sub(limit);
-                entry[start..].to_vec()
+                entry[start..]
+                    .iter()
+                    .map(|item| item.content.clone())
+                    .collect()
             })
             .unwrap_or_default()
     }

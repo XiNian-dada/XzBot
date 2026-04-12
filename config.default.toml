@@ -63,6 +63,8 @@ api_key = ""
 model = "mock"
 # 当主模型超时/上游报错时，按顺序尝试这些候补模型。
 fallback_models = []
+# 某些 OpenAI 兼容网关只有在 stream=true 时才会正常返回正文。
+stream_chat_completions = false
 temperature = 0.7
 max_tokens = 512
 timeout_ms = 20000
@@ -76,3 +78,8 @@ proxy_enabled = false
 proxy_url = ""
 proxy_test_url = "https://www.baidu.com"
 proxy_timeout_ms = 5000
+
+[web_admin]
+enabled = false
+token = ""
+title = "XzBot Console"

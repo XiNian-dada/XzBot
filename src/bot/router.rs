@@ -18,7 +18,7 @@ use crate::{
     config::{Config, PermissionMode, TriggerMode},
     logger::debug as log_debug,
     onebot::{action::ActionRequest, event::MessageEvent},
-    plugins::PluginManager,
+    plugins::{PluginManager, PluginSummary},
 };
 
 /// Central router that dispatches events to plugins or AI chat.
@@ -149,9 +149,41 @@ impl BotRouter {
             .await
     }
 
+    /// Returns true when the current group message should enter recent-context cache only after routing.
+    ///
+    /// 这里主要保护两类情况：
+    /// - 当前消息本身正在触发 Bot，不应被 `get_recent_group_context` 立即读回去污染当前轮
+    /// - 当前消息可能被插件接管，也不应在接管前先作为“最近群聊”暴露给模型
+    pub fn should_defer_recent_group_cache(&self, event: &MessageEvent) -> bool {
+        if event.post_type != "message"
+            || event.message_type != "group"
+            || event.user_id == event.self_id
+        {
+            return false;
+        }
+        if self.handle_blacklist_command(event).is_some() {
+            return true;
+        }
+
+        let normalized = normalize_command_text(event);
+        if !normalized.is_empty() && self.plugins.has_matching_command(&normalized) {
+            return true;
+        }
+        if self.plugins.has_matching_event_subscriber(event) {
+            return true;
+        }
+
+        self.should_trigger_group(event)
+    }
+
     /// Gracefully shuts down all managed plugins.
     pub async fn shutdown_plugins(&self) {
         self.plugins.shutdown().await;
+    }
+
+    /// Returns plugin summaries for admin/diagnostics use.
+    pub fn plugin_summaries(&self) -> Vec<PluginSummary> {
+        self.plugins.summaries()
     }
 
     /// Applies permission and group blacklist policy.

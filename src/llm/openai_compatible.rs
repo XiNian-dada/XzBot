@@ -52,6 +52,7 @@ pub struct OpenAiCompatibleLlm {
     endpoint: String,
     base_url: String,
     wire_api: OpenAiWireApi,
+    stream_chat_completions: bool,
     api_key: String,
     model: String,
     reasoning_effort: String,
@@ -67,6 +68,12 @@ pub struct OpenAiCompatibleLlm {
     plugins: PluginManager,
     vision_mode: VisionMode,
     ocr_settings: OcrSettings,
+}
+
+struct ToolExecutionResult {
+    text: String,
+    chat_followup: Option<Value>,
+    responses_followup: Option<Value>,
 }
 
 impl OpenAiCompatibleLlm {
@@ -147,6 +154,7 @@ impl OpenAiCompatibleLlm {
             endpoint,
             base_url: config.base_url.clone(),
             wire_api: config.wire_api,
+            stream_chat_completions: config.stream_chat_completions,
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             reasoning_effort: config.reasoning_effort.clone(),
@@ -176,6 +184,31 @@ impl OpenAiCompatibleLlm {
             },
         })
     }
+}
+
+fn append_recent_group_image_note(mut context: String, ocr_text: &str) -> String {
+    let trimmed = ocr_text.trim();
+    if trimmed.is_empty() {
+        return context;
+    }
+    if !context.is_empty() {
+        context.push_str("\n\n");
+    }
+    context.push_str("[最近群聊图片补充]\n");
+    context.push_str(&truncate_recent_group_note(trimmed, 4_000));
+    context
+}
+
+fn truncate_recent_group_note(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...(truncated)");
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[async_trait]
@@ -378,8 +411,11 @@ impl OpenAiCompatibleLlm {
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": call.id,
-                        "content": result
+                        "content": result.text
                     }));
+                    if let Some(followup) = result.chat_followup {
+                        messages.push(followup);
+                    }
                     continue;
                 }
 
@@ -397,8 +433,11 @@ impl OpenAiCompatibleLlm {
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": call.id,
-                            "content": result
+                            "content": result.text
                         }));
+                        if let Some(followup) = result.chat_followup {
+                            messages.push(followup);
+                        }
                         continue;
                     }
 
@@ -472,8 +511,11 @@ impl OpenAiCompatibleLlm {
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": result
+                    "content": result.text
                 }));
+                if let Some(followup) = result.chat_followup {
+                    messages.push(followup);
+                }
             }
 
             if executed_in_this_round == 0 && skipped_duplicate > 0 {
@@ -848,6 +890,12 @@ impl OpenAiCompatibleLlm {
             };
 
             let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
             let body = response
                 .text()
                 .await
@@ -870,8 +918,16 @@ impl OpenAiCompatibleLlm {
                 bail!("AI endpoint returned {}: {}", status, body);
             }
 
-            let value: Value =
-                serde_json::from_str(&body).context("failed to parse AI response JSON")?;
+            let looks_like_stream = payload.get("stream").and_then(Value::as_bool) == Some(true)
+                || content_type.contains("text/event-stream")
+                || body.trim_start().starts_with("data:");
+            let value: Value = if self.wire_api == OpenAiWireApi::ChatCompletions
+                && looks_like_stream
+            {
+                parse_openai_stream_body(&body).context("failed to parse AI streaming response")?
+            } else {
+                serde_json::from_str(&body).context("failed to parse AI response JSON")?
+            };
             record_usage_from_openai_response(&value, self.debug);
             return Ok(value);
         }
@@ -881,7 +937,13 @@ impl OpenAiCompatibleLlm {
 
     fn prepare_openai_payload(&self, payload: Value) -> Value {
         match self.wire_api {
-            OpenAiWireApi::ChatCompletions => apply_default_no_thinking_hints(payload),
+            OpenAiWireApi::ChatCompletions => {
+                let mut payload = apply_default_no_thinking_hints(payload);
+                if self.stream_chat_completions && payload.get("stream").is_none() {
+                    payload["stream"] = Value::Bool(true);
+                }
+                payload
+            }
             OpenAiWireApi::Responses => apply_responses_defaults(
                 payload,
                 &self.reasoning_effort,
@@ -1123,6 +1185,73 @@ impl OpenAiCompatibleLlm {
         text
     }
 
+    async fn build_recent_group_context_tool_result(
+        &self,
+        group_id: i64,
+        limit: usize,
+    ) -> ToolExecutionResult {
+        let Some(context) = self.store.recent_group_context(group_id, limit, 8_000) else {
+            return ToolExecutionResult {
+                text: "当前没有可用的最近群聊上下文。".to_string(),
+                chat_followup: None,
+                responses_followup: None,
+            };
+        };
+
+        let parsed = parse_user_content(&context);
+        let has_images = !parsed.image_urls.is_empty() || !parsed.image_files.is_empty();
+        if !has_images {
+            return ToolExecutionResult {
+                text: context,
+                chat_followup: None,
+                responses_followup: None,
+            };
+        }
+
+        if self.should_send_images() {
+            let followup_prompt = ParsedUserContent {
+                text: "以下图片来自最近群聊，仅作为上下文补充，不是新的用户提问。请结合这些图片理解群里刚刚发的内容。".to_string(),
+                image_urls: parsed.image_urls.clone(),
+                image_files: parsed.image_files.clone(),
+            };
+            let content = self
+                .build_openai_user_content_with_images(followup_prompt)
+                .await;
+            let chat_followup = json!({
+                "role": "user",
+                "content": content,
+            });
+            let responses_followup = convert_chat_message_to_responses_item(&chat_followup, "user");
+
+            return ToolExecutionResult {
+                text: context,
+                chat_followup: Some(chat_followup),
+                responses_followup,
+            };
+        }
+
+        if self.should_use_ocr() {
+            let ocr_text = self
+                .build_user_text_with_ocr(ParsedUserContent {
+                    text: String::new(),
+                    image_urls: parsed.image_urls,
+                    image_files: parsed.image_files,
+                })
+                .await;
+            return ToolExecutionResult {
+                text: append_recent_group_image_note(context, &ocr_text),
+                chat_followup: None,
+                responses_followup: None,
+            };
+        }
+
+        ToolExecutionResult {
+            text: context,
+            chat_followup: None,
+            responses_followup: None,
+        }
+    }
+
     fn should_send_images(&self) -> bool {
         match self.vision_mode {
             VisionMode::Multimodal => true,
@@ -1139,8 +1268,12 @@ impl OpenAiCompatibleLlm {
         }
     }
 
-    async fn execute_tool_call(&self, session_id: &str, call: &OpenAiToolCall) -> String {
-        match call.name.as_str() {
+    async fn execute_tool_call(
+        &self,
+        session_id: &str,
+        call: &OpenAiToolCall,
+    ) -> ToolExecutionResult {
+        let text = match call.name.as_str() {
             "search_web" => {
                 let query = extract_argument_str(&call.arguments, &["query", "q", "keyword"])
                     .or_else(|| {
@@ -1152,11 +1285,15 @@ impl OpenAiCompatibleLlm {
                     .unwrap_or_default();
                 let query = strip_sender_prefix(query.trim()).trim().to_string();
                 if query.is_empty() {
-                    return tool_error_with_hint(
-                        "search_web",
-                        "query is empty",
-                        "提供更具体的关键词；如果用户已经给了网页链接，改用 fetch_url。",
-                    );
+                    return ToolExecutionResult {
+                        text: tool_error_with_hint(
+                            "search_web",
+                            "query is empty",
+                            "提供更具体的关键词；如果用户已经给了网页链接，改用 fetch_url。",
+                        ),
+                        chat_followup: None,
+                        responses_followup: None,
+                    };
                 }
                 // Weather policy: search web first for multi-day forecast; use get_weather only as fallback.
                 let weather_query = weather_intent_from_text(&query.to_lowercase());
@@ -1189,13 +1326,17 @@ impl OpenAiCompatibleLlm {
                             if let Ok(weather) =
                                 get_weather(&self.client, &location, self.debug).await
                             {
-                                return wrap_untrusted_tool_output(
-                                    "get_weather",
-                                    format!(
-                                        "search_web error: {err}\n\n[weather_fallback]\n{}",
-                                        weather
+                                return ToolExecutionResult {
+                                    text: wrap_untrusted_tool_output(
+                                        "get_weather",
+                                        format!(
+                                            "search_web error: {err}\n\n[weather_fallback]\n{}",
+                                            weather
+                                        ),
                                     ),
-                                );
+                                    chat_followup: None,
+                                    responses_followup: None,
+                                };
                             }
                         }
                         tool_error_with_hint(
@@ -1217,11 +1358,15 @@ impl OpenAiCompatibleLlm {
                     .unwrap_or_default();
                 let url = url.trim().to_string();
                 if url.is_empty() {
-                    return tool_error_with_hint(
-                        "fetch_url",
-                        "url is empty",
-                        "直接提供一个完整链接；如果现在只有主题没有链接，先用 search_web。",
-                    );
+                    return ToolExecutionResult {
+                        text: tool_error_with_hint(
+                            "fetch_url",
+                            "url is empty",
+                            "直接提供一个完整链接；如果现在只有主题没有链接，先用 search_web。",
+                        ),
+                        chat_followup: None,
+                        responses_followup: None,
+                    };
                 }
                 match fetch_url(&self.client, &url, self.debug, &self.network).await {
                     Ok(v) => wrap_untrusted_tool_output("fetch_url", v),
@@ -1251,11 +1396,15 @@ impl OpenAiCompatibleLlm {
                         .unwrap_or_default();
                 let location = strip_sender_prefix(location.trim()).trim().to_string();
                 if location.is_empty() {
-                    return tool_error_with_hint(
-                        "get_weather",
-                        "location is empty",
-                        "提供更具体的地点；如果需要未来多天预报，优先改用 search_web。",
-                    );
+                    return ToolExecutionResult {
+                        text: tool_error_with_hint(
+                            "get_weather",
+                            "location is empty",
+                            "提供更具体的地点；如果需要未来多天预报，优先改用 search_web。",
+                        ),
+                        chat_followup: None,
+                        responses_followup: None,
+                    };
                 }
                 match get_weather(&self.client, &location, self.debug).await {
                     Ok(v) => wrap_untrusted_tool_output("get_weather", v),
@@ -1274,19 +1423,21 @@ impl OpenAiCompatibleLlm {
                     .unwrap_or(10)
                     .clamp(1, 10) as usize;
                 let Some(group_id) = session_group_id(session_id) else {
-                    return tool_error_with_hint(
-                        "get_recent_group_context",
-                        "current session is not a group chat",
-                        "只能在群聊会话里查询最近群聊上下文。",
-                    );
+                    return ToolExecutionResult {
+                        text: tool_error_with_hint(
+                            "get_recent_group_context",
+                            "current session is not a group chat",
+                            "只能在群聊会话里查询最近群聊上下文。",
+                        ),
+                        chat_followup: None,
+                        responses_followup: None,
+                    };
                 };
-                match self.store.recent_group_context(group_id, limit, 8_000) {
-                    Some(v) => wrap_untrusted_tool_output("get_recent_group_context", v),
-                    None => wrap_untrusted_tool_output(
-                        "get_recent_group_context",
-                        "当前没有可用的最近群聊上下文。".to_string(),
-                    ),
-                }
+                let mut result = self
+                    .build_recent_group_context_tool_result(group_id, limit)
+                    .await;
+                result.text = wrap_untrusted_tool_output("get_recent_group_context", result.text);
+                return result;
             }
             _ => match self
                 .plugins
@@ -1301,6 +1452,12 @@ impl OpenAiCompatibleLlm {
                     "检查参数是否完整，或换用别的内置工具/插件工具。",
                 ),
             },
+        };
+
+        ToolExecutionResult {
+            text,
+            chat_followup: None,
+            responses_followup: None,
         }
     }
 }

@@ -20,6 +20,12 @@ pub struct MessageEvent {
     /// Group id for group messages.
     #[serde(default)]
     pub group_id: Option<i64>,
+    /// Message id when provider includes one.
+    ///
+    /// 这里不强依赖 OneBot 一定给数值型 message_id，因此保留成原始 JSON 值，
+    /// 后续只在“最近群聊缓存键”这类场景里做宽松提取。
+    #[serde(default)]
+    pub message_id: Option<Value>,
     /// Raw CQ-coded text.
     #[serde(default)]
     pub raw_message: String,
@@ -177,6 +183,31 @@ impl MessageEvent {
             return;
         }
         self.enriched_parts.push(part);
+    }
+
+    /// Returns a stable cache key for rolling recent-group-context entries.
+    ///
+    /// 优先使用平台提供的 `message_id`，这样同一条消息可以先写“基础版”，
+    /// 富化完成后再原地更新成“完整版”，避免并发时出现漏消息或重复消息。
+    ///
+    /// 如果上游没有 `message_id`，就回退到消息元数据哈希；虽然不如真正的 message id
+    /// 稳定，但足够让同一次事件处理中的“先写后改”命中同一条缓存记录。
+    pub fn recent_context_cache_key(&self) -> String {
+        if let Some(id) = extract_string_like_value(self.message_id.as_ref()) {
+            return format!("msg:{id}");
+        }
+
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.post_type.hash(&mut hasher);
+        self.message_type.hash(&mut hasher);
+        self.self_id.hash(&mut hasher);
+        self.user_id.hash(&mut hasher);
+        self.group_id.hash(&mut hasher);
+        self.raw_message.hash(&mut hasher);
+        self.base_text().hash(&mut hasher);
+        format!("fallback:{:016x}", hasher.finish())
     }
 
     /// Returns best-effort sender display name.

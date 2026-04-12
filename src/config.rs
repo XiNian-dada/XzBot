@@ -27,12 +27,14 @@ const OPTIONAL_OVERRIDE_FILES: &[&str] = &[
     "ai.toml",
     "search.toml",
     "network.toml",
+    "web_admin.toml",
 ];
 const STRUCTURED_OVERLAY_MAPPINGS: &[(&str, &str)] = &[
     ("persona.toml", "persona"),
     ("ai.toml", "ai"),
     ("search.toml", "search"),
     ("network.toml", "network"),
+    ("web_admin.toml", "web_admin"),
 ];
 
 /// 根运行时配置。
@@ -68,6 +70,9 @@ pub struct Config {
     /// Outbound network/proxy settings.
     #[serde(default)]
     pub network: NetworkConfig,
+    /// Web admin console settings.
+    #[serde(default)]
+    pub web_admin: WebAdminConfig,
 }
 
 impl Config {
@@ -202,6 +207,9 @@ impl Config {
                 bail!("network.proxy_test_url cannot be empty when proxy is enabled");
             }
         }
+        if self.web_admin.enabled && self.web_admin.token.trim().is_empty() {
+            bail!("web_admin.token cannot be empty when web_admin.enabled = true");
+        }
         if self.group.trigger_mode == TriggerMode::Prefix && self.group.prefixes.is_empty() {
             bail!("group.prefixes cannot be empty when trigger_mode = \"prefix\"");
         }
@@ -228,6 +236,14 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// 返回主配置和所有可选覆盖文件的稳定文件名顺序。
+pub fn known_config_file_names() -> Vec<&'static str> {
+    let mut files = Vec::with_capacity(1 + OPTIONAL_OVERRIDE_FILES.len());
+    files.push("config.toml");
+    files.extend_from_slice(OPTIONAL_OVERRIDE_FILES);
+    files
 }
 
 /// 尝试把旧版“单文件配置”迁移到新的 `config/` 目录结构。
@@ -505,6 +521,7 @@ enabled = false
 # api_key = ""
 # model = "gpt-4.1-mini"
 # fallback_models = ["gpt-4.1-nano", "gpt-4o-mini"]
+# stream_chat_completions = false
 # temperature = 0.7
 # max_tokens = 512
 # timeout_ms = 20000
@@ -536,6 +553,16 @@ enabled = false
 # proxy_url = ""
 # proxy_test_url = "https://www.baidu.com"
 # proxy_timeout_ms = 5000
+"#
+        }
+        "web_admin.toml" => {
+            r#"# 可选覆盖：Web 控制面板配置
+enabled = false
+
+[web_admin]
+# enabled = true
+# token = "change-me"
+# title = "XzBot Console"
 "#
         }
         _ => "enabled = false\n",
@@ -676,6 +703,14 @@ pub struct AiConfig {
     /// Additional model ids used as fallback chain.
     #[serde(default)]
     pub fallback_models: Vec<String>,
+    /// Whether `/chat/completions` requests should be sent as SSE stream mode.
+    ///
+    /// Some third-party OpenAI-compatible gateways only return valid content when
+    /// `stream=true` is enabled, even if the caller eventually wants one complete reply.
+    /// In that case XzBot will request stream mode and locally fold the SSE chunks back
+    /// into a normal Chat Completions-style response object.
+    #[serde(default)]
+    pub stream_chat_completions: bool,
     /// Reasoning effort hint for providers that support it.
     #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
@@ -743,6 +778,30 @@ impl AiConfig {
             }
         }
         models
+    }
+}
+
+/// Web 控制面板配置。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebAdminConfig {
+    /// Whether the dashboard routes are active.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Shared secret used by the login form.
+    #[serde(default)]
+    pub token: String,
+    /// Title shown in the dashboard header.
+    #[serde(default = "default_web_admin_title")]
+    pub title: String,
+}
+
+impl Default for WebAdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: String::new(),
+            title: default_web_admin_title(),
+        }
     }
 }
 
@@ -866,6 +925,11 @@ fn default_openai_wire_api() -> OpenAiWireApi {
 /// Default reasoning effort hint.
 fn default_reasoning_effort() -> String {
     "low".to_string()
+}
+
+/// Default web admin page title.
+fn default_web_admin_title() -> String {
+    "XzBot Console".to_string()
 }
 
 /// Default vision mode.

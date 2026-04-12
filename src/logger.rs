@@ -2,6 +2,7 @@
 
 use std::{
     collections::VecDeque,
+    io::{self, Write},
     sync::{Mutex, OnceLock},
 };
 
@@ -20,25 +21,34 @@ fn push_recent(line: String) {
     }
 }
 
+/// 把一行标准输出同时写到真实控制台和内存日志缓冲。
+pub fn print_stdout_line(line: String) {
+    let _ = writeln!(io::stdout(), "{line}");
+    push_recent(line);
+}
+
+/// 把一行标准错误同时写到真实控制台和内存日志缓冲。
+pub fn print_stderr_line(line: String) {
+    let _ = writeln!(io::stderr(), "{line}");
+    push_recent(line);
+}
+
 /// Logs an info-level message.
 pub fn info(msg: impl AsRef<str>) {
     let line = format!("[INFO] {}", msg.as_ref());
-    println!("{line}");
-    push_recent(line);
+    print_stdout_line(line);
 }
 
 /// Logs a warning-level message.
 pub fn warn(msg: impl AsRef<str>) {
     let line = format!("[WARN] {}", msg.as_ref());
-    eprintln!("{line}");
-    push_recent(line);
+    print_stderr_line(line);
 }
 
 /// Logs an error-level message.
 pub fn error(msg: impl AsRef<str>) {
     let line = format!("[ERROR] {}", msg.as_ref());
-    eprintln!("{line}");
-    push_recent(line);
+    print_stderr_line(line);
 }
 
 /// Logs an error-level message and appends the complete anyhow error chain.
@@ -55,8 +65,7 @@ pub fn warn_err(msg: impl AsRef<str>, err: &Error) {
 pub fn debug(enabled: bool, msg: impl AsRef<str>) {
     if enabled {
         let line = format!("[DEBUG] {}", msg.as_ref());
-        println!("{line}");
-        push_recent(line);
+        print_stdout_line(line);
     }
 }
 

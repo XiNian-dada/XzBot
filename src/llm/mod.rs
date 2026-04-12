@@ -191,14 +191,14 @@ pub fn temporary_network_reply() -> String {
 ///
 /// Session ids are assembled as `provider:model:group:<group_id>:<user_id>` for group chats.
 pub fn session_group_id(session_id: &str) -> Option<i64> {
-    let mut parts = session_id.split(':');
-    let _provider = parts.next()?;
-    let _model = parts.next()?;
-    let chat_type = parts.next()?;
+    // Parse from tail so model/provider names containing ':' do not break group detection.
+    let mut tail = session_id.rsplit(':');
+    let _user_id = tail.next()?;
+    let group_id = tail.next()?;
+    let chat_type = tail.next()?;
     if chat_type != "group" {
         return None;
     }
-    let group_id = parts.next()?;
     group_id.parse::<i64>().ok()
 }
 

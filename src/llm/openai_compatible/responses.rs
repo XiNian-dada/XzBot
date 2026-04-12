@@ -77,8 +77,13 @@ impl OpenAiCompatibleLlm {
                     }
                     ctx.input.push(build_responses_function_call_item(&call));
                     let result = self.execute_tool_call(&session_id, &call).await;
-                    ctx.input
-                        .push(build_responses_function_call_output_item(&call.id, &result));
+                    ctx.input.push(build_responses_function_call_output_item(
+                        &call.id,
+                        &result.text,
+                    ));
+                    if let Some(followup) = result.responses_followup {
+                        ctx.input.push(followup);
+                    }
                     continue;
                 }
 
@@ -143,8 +148,13 @@ impl OpenAiCompatibleLlm {
                 }
                 let result = self.execute_tool_call(&session_id, &call).await;
                 executed_in_this_round += 1;
-                ctx.input
-                    .push(build_responses_function_call_output_item(&call.id, &result));
+                ctx.input.push(build_responses_function_call_output_item(
+                    &call.id,
+                    &result.text,
+                ));
+                if let Some(followup) = result.responses_followup {
+                    ctx.input.push(followup);
+                }
             }
 
             if executed_in_this_round == 0 && skipped_duplicate > 0 {

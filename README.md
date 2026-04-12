@@ -203,6 +203,23 @@ timeout_ms = 60000
 3. 老接口仍用 `wire_api = "chat_completions"`
 4. `disable_response_storage` 和 `reasoning_effort` 只对支持该字段的网关生效
 
+### OpenAI Chat Streaming 兼容
+
+有些第三方 OpenAI 兼容网关在 `/chat/completions` 下只有 `stream=true` 时才会稳定返回正文。
+这类网关可以这样配：
+
+```toml
+[ai]
+provider = "openai_compatible"
+base_url = "https://your-gateway.example/v1"
+wire_api = "chat_completions"
+stream_chat_completions = true
+api_key = "YOUR_API_KEY"
+model = "gpt-5.4"
+```
+
+XzBot 会在内部把 SSE 流式块重新拼成普通的 Chat Completions 返回结构，所以对上层会话、工具调用和日志行为保持不变。
+
 ### 多模型回退
 
 如果同一个 provider / base_url / api_key 下有多个模型可用，可以配置一条回退链：
@@ -228,6 +245,39 @@ fallback_models = ["gpt-4.1", "gpt-4o-mini"]
 
 所有 HTTP 请求默认走同一代理（LLM / 搜索 / OCR / fetch_url 等）。
 如需 **仅让 Paddle OCR 直连**，可设置 `paddle_use_proxy=false`。
+
+### Web 控制面板
+
+如果你不想继续手改一堆 TOML，可以开启内置控制面板：
+
+```toml
+[web_admin]
+enabled = true
+token = "请换成你自己的强随机 token"
+title = "XzBot Console"
+```
+
+启动后访问：
+
+- `http://<host>:<port>/admin`
+
+当前控制面板支持：
+
+1. 登录鉴权
+2. 查看当前 provider / model / WS 连接状态
+3. 编辑主配置和所有覆盖文件
+4. 在“插件”页查看已加载插件、命令、事件订阅和工具
+5. 在“插件”页用文件管理器方式浏览并编辑 `Plugins/<插件名>/` 目录里的小体积文本文件
+6. 查看最近日志
+7. 保存配置后直接触发 `/reload` 对应的运行时热重载
+
+说明：
+
+1. 控制面板使用同一个 HTTP 服务，不额外开端口
+2. 修改 `server.host / server.port / server.ws_path` 这类监听项后，面板会提示你“需要重启进程后完全生效”
+3. 插件文件不会再混进“配置”页；“配置”页只放核心配置和覆盖文件
+4. 插件文件管理器只会扫描 `Plugins/<插件名>/` 目录里的小体积文本文件，不会把插件二进制本体或明显的二进制文件放进编辑器
+5. 控制面板本身不引入第二套配置来源，保存后仍然是直接写回磁盘文件
 
 ### URL 抓取策略
 

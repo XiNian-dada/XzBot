@@ -76,6 +76,208 @@ pub(super) fn parse_openai_choice(
     Ok((content, calls, message, finish_reason))
 }
 
+/// 把 Chat Completions 的 SSE 文本流折叠回普通 JSON 响应。
+///
+/// 某些第三方网关虽然挂着 OpenAI 兼容路径，但只有 `stream=true` 时才会返回有效正文。
+/// XzBot 不需要把每个 token 实时转发给 QQ，因此这里会把整段 SSE 读完，再重组成：
+/// `choices[0].message.content / tool_calls / finish_reason`
+/// 以便复用现有的普通解析逻辑。
+pub(super) fn parse_openai_stream_body(body: &str) -> Result<Value> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        bail!("empty stream body");
+    }
+
+    if trimmed.starts_with('{') {
+        return serde_json::from_str(trimmed).context("failed to parse AI response JSON");
+    }
+
+    #[derive(Default)]
+    struct ToolCallChunk {
+        id: String,
+        name: String,
+        arguments: String,
+    }
+
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut finish_reason: Option<String> = None;
+    let mut tool_calls: Vec<ToolCallChunk> = Vec::new();
+    let mut function_call_name = String::new();
+    let mut function_call_arguments = String::new();
+    let mut usage = Value::Null;
+    let mut saw_data = false;
+
+    for raw_line in trimmed.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(':') || !line.starts_with("data:") {
+            continue;
+        }
+
+        let data = line.trim_start_matches("data:").trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            break;
+        }
+
+        let event: Value = match serde_json::from_str(data) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        saw_data = true;
+
+        if usage.is_null() {
+            if let Some(found) = event.get("usage") {
+                usage = found.clone();
+            }
+        }
+
+        let Some(choice) = event
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            continue;
+        };
+
+        if finish_reason.is_none() {
+            finish_reason = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string());
+        }
+
+        let delta = choice
+            .get("delta")
+            .or_else(|| choice.get("message"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            content.push_str(text);
+        } else if let Some(parts) = delta.get("content").and_then(Value::as_array) {
+            for part in parts {
+                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                match part_type {
+                    "text" | "input_text" | "output_text" => {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            content.push_str(text);
+                        }
+                    }
+                    "refusal" => {
+                        if let Some(text) = part
+                            .get("refusal")
+                            .or_else(|| part.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            content.push_str(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+            reasoning.push_str(text);
+        }
+
+        if let Some(stream_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in stream_tool_calls {
+                let index = tool_call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(tool_calls.len());
+                if tool_calls.len() <= index {
+                    tool_calls.resize_with(index + 1, ToolCallChunk::default);
+                }
+                let item = &mut tool_calls[index];
+                if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                    if !id.trim().is_empty() {
+                        item.id = id.to_string();
+                    }
+                }
+                if let Some(function) = tool_call.get("function") {
+                    if let Some(name) = function.get("name").and_then(Value::as_str) {
+                        if !name.is_empty() {
+                            item.name.push_str(name);
+                        }
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        item.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+
+        if let Some(function_call) = delta.get("function_call") {
+            if let Some(name) = function_call.get("name").and_then(Value::as_str) {
+                function_call_name.push_str(name);
+            }
+            if let Some(arguments) = function_call.get("arguments").and_then(Value::as_str) {
+                function_call_arguments.push_str(arguments);
+            }
+        }
+    }
+
+    if !saw_data {
+        bail!("failed to parse streaming AI response");
+    }
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !reasoning.trim().is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
+
+    let tool_calls_json: Vec<Value> = tool_calls
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, tool_call)| {
+            if tool_call.name.trim().is_empty() {
+                return None;
+            }
+            Some(json!({
+                "id": if tool_call.id.trim().is_empty() {
+                    format!("stream_tool_call_{index}")
+                } else {
+                    tool_call.id
+                },
+                "type": "function",
+                "function": {
+                    "name": tool_call.name,
+                    "arguments": tool_call.arguments,
+                }
+            }))
+        })
+        .collect();
+    if !tool_calls_json.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls_json);
+    } else if !function_call_name.trim().is_empty() {
+        message["function_call"] = json!({
+            "name": function_call_name,
+            "arguments": function_call_arguments,
+        });
+    }
+
+    let mut value = json!({
+        "choices": [{
+            "message": message,
+            "finish_reason": finish_reason,
+        }]
+    });
+    if !usage.is_null() {
+        value["usage"] = usage;
+    }
+
+    Ok(value)
+}
+
 /// 解析 Responses API 返回体，抽取文本、工具调用和截断原因。
 pub(super) fn parse_responses_output(value: &Value) -> Result<ResponsesOutput> {
     let output = value

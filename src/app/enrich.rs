@@ -265,7 +265,7 @@ fn extract_quote_text_from_message_data(data: &Value) -> Option<String> {
     if let Some(message) = data.get("message") {
         if let Some(text) = message_value_to_text(message) {
             if !text.trim().is_empty() {
-                return Some(text);
+                return Some(attach_quote_sender_prefix(data, text));
             }
         }
     }
@@ -274,6 +274,40 @@ fn extract_quote_text_from_message_data(data: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(strip_cq_to_text)
         .filter(|v| !v.trim().is_empty())
+        .map(|text| attach_quote_sender_prefix(data, text))
+}
+
+fn attach_quote_sender_prefix(data: &Value, text: String) -> String {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return text;
+    }
+
+    let sender_name = data
+        .get("sender")
+        .and_then(Value::as_object)
+        .and_then(|sender| {
+            sender
+                .get("card")
+                .or_else(|| sender.get("nickname"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            data.get("user_id").and_then(|value| {
+                value
+                    .as_i64()
+                    .map(|n| n.to_string())
+                    .or_else(|| value.as_str().map(str::to_string))
+            })
+        });
+
+    match sender_name {
+        Some(sender) => format!("{sender}：{text}"),
+        None => text,
+    }
 }
 
 /// 把 OneBot 的 `message` 字段统一转换成纯文本。
@@ -285,14 +319,7 @@ fn extract_quote_text_from_message_data(data: &Value) -> Option<String> {
 /// 图片会被替换成 `[图片]` 占位符，避免后续文本链路直接丢失上下文。
 fn message_value_to_text(message: &Value) -> Option<String> {
     match message {
-        Value::String(raw) => {
-            let text = strip_cq_to_text(raw);
-            if text.trim().is_empty() {
-                None
-            } else {
-                Some(text)
-            }
-        }
+        Value::String(raw) => extract_readable_text_from_raw(raw),
         Value::Array(segments) => {
             let mut out = String::new();
             for seg in segments {
@@ -338,6 +365,27 @@ fn message_value_to_text(message: &Value) -> Option<String> {
                             out.push_str(&qq);
                         }
                     }
+                    "json" | "xml" | "markdown" | "richmsg" => {
+                        if let Some(summary) = seg
+                            .get("data")
+                            .and_then(extract_readable_text_from_value)
+                            .or_else(|| {
+                                seg.get("data")
+                                    .and_then(|d| d.get("data").and_then(Value::as_str))
+                                    .and_then(extract_readable_text_from_raw)
+                            })
+                        {
+                            if !out.ends_with(' ') && !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push_str(&summary);
+                        } else {
+                            if !out.ends_with(' ') && !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push_str("[卡片消息]");
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -348,7 +396,146 @@ fn message_value_to_text(message: &Value) -> Option<String> {
                 Some(normalized)
             }
         }
+        Value::Object(map) => {
+            if let Some(message) = map
+                .get("message")
+                .or_else(|| map.get("messages"))
+                .or_else(|| map.get("content"))
+            {
+                if let Some(text) = message_value_to_text(message) {
+                    if !text.trim().is_empty() {
+                        return Some(text);
+                    }
+                }
+            }
+            extract_readable_text_from_object(map)
+        }
         _ => None,
+    }
+}
+
+fn extract_readable_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(raw) => extract_readable_text_from_raw(raw),
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                if let Some(text) = extract_readable_text_from_value(item) {
+                    if !text.trim().is_empty() {
+                        out.push(text);
+                    }
+                }
+                if out.len() >= 4 {
+                    break;
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out.join(" | "))
+            }
+        }
+        Value::Object(map) => extract_readable_text_from_object(map),
+        _ => None,
+    }
+}
+
+fn extract_readable_text_from_object(map: &serde_json::Map<String, Value>) -> Option<String> {
+    let mut pieces = Vec::new();
+    let mut seen = HashSet::new();
+
+    for key in [
+        "prompt",
+        "title",
+        "summary",
+        "brief",
+        "desc",
+        "description",
+        "text",
+        "content",
+        "name",
+    ] {
+        if let Some(value) = map.get(key) {
+            if let Some(text) = extract_readable_text_from_value(value) {
+                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !normalized.is_empty() && seen.insert(normalized.clone()) {
+                    pieces.push(normalized);
+                }
+            }
+        }
+        if pieces.len() >= 4 {
+            break;
+        }
+    }
+
+    if pieces.is_empty() {
+        None
+    } else {
+        Some(trim_for_context(&pieces.join(" | "), 500))
+    }
+}
+
+fn extract_readable_text_from_raw(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        if let Some(text) = extract_readable_text_from_value(&value) {
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    if let Some(text) = extract_xmlish_summary(raw) {
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+
+    let text = strip_cq_to_text(raw);
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn extract_xmlish_summary(raw: &str) -> Option<String> {
+    let mut pieces = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in ["prompt", "title", "summary", "brief", "desc", "des", "text"] {
+        if let Some(text) = extract_xml_tag_text(raw, tag) {
+            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !normalized.is_empty() && seen.insert(normalized.clone()) {
+                pieces.push(normalized);
+            }
+        }
+        if pieces.len() >= 4 {
+            break;
+        }
+    }
+
+    if pieces.is_empty() {
+        None
+    } else {
+        Some(trim_for_context(&pieces.join(" | "), 500))
+    }
+}
+
+fn extract_xml_tag_text(raw: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = raw.find(&open)?;
+    let body_start = start + open.len();
+    let end_rel = raw[body_start..].find(&close)?;
+    let text = raw[body_start..body_start + end_rel].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
     }
 }
 
@@ -766,22 +953,24 @@ async fn load_file_context(
         ));
     };
 
-    if !looks_like_text_file(
+    let Some(text) = extract_file_text(
         &file_label,
         downloaded.content_type.as_deref(),
         &downloaded.bytes,
-    ) {
+        downloaded.truncated_by_bytes,
+    ) else {
+        let detail = if is_docx_file(&file_label, downloaded.content_type.as_deref()) {
+            "（docx 文件无法解析，或文件在预览阶段被截断）"
+        } else {
+            "（非文本文件，未注入内容）"
+        };
         return Some(format!(
-            "{} {}（非文本文件，未注入内容）",
+            "{} {}{}",
             if quoted { "[引用文件]" } else { "[文件]" },
-            file_label
+            file_label,
+            detail
         ));
-    }
-
-    let mut text = String::from_utf8_lossy(&downloaded.bytes).to_string();
-    if downloaded.truncated_by_bytes {
-        text.push_str("\n...(file truncated by byte limit)");
-    }
+    };
     let preview = trim_for_context(&text, FILE_PREVIEW_MAX_CHARS);
     Some(format!(
         "{} {}\n{}",
@@ -793,6 +982,36 @@ async fn load_file_context(
         file_label,
         preview
     ))
+}
+
+/// 从文件预览字节里尽量提取出适合喂给模型的正文文本。
+///
+/// 这里区分两类文件：
+/// - 普通文本文件：直接按 UTF-8/宽松文本读取
+/// - `.docx`：先解压 OOXML 容器，再从 `word/*.xml` 中提取正文
+fn extract_file_text(
+    name: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+    truncated_by_bytes: bool,
+) -> Option<String> {
+    if is_docx_file(name, content_type) {
+        let mut text = extract_docx_text(bytes)?;
+        if truncated_by_bytes {
+            text.push_str("\n...(docx preview truncated by byte limit)");
+        }
+        return Some(text);
+    }
+
+    if !looks_like_text_file(name, content_type, bytes) {
+        return None;
+    }
+
+    let mut text = String::from_utf8_lossy(bytes).to_string();
+    if truncated_by_bytes {
+        text.push_str("\n...(file truncated by byte limit)");
+    }
+    Some(text)
 }
 
 const FORWARD_MAX_NODES: usize = 12;
@@ -1325,6 +1544,207 @@ fn looks_like_text_file(name: &str, content_type: Option<&str>, bytes: &[u8]) ->
     // 兜底：前几个 KB 内如果没有大量 NUL 字节，则把它当文本试着读。
     let sample = &bytes[..bytes.len().min(4096)];
     !sample.iter().any(|b| *b == 0)
+}
+
+/// 判断文件是否是 Word 的 `.docx` 文档。
+fn is_docx_file(name: &str, content_type: Option<&str>) -> bool {
+    if let Some(content_type) = content_type {
+        let lower = content_type.to_lowercase();
+        if lower.contains("openxmlformats-officedocument.wordprocessingml.document")
+            || lower.contains("application/vnd.ms-word.document.macroenabled.12")
+        {
+            return true;
+        }
+    }
+
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| v.eq_ignore_ascii_case("docx"))
+        .unwrap_or(false)
+}
+
+/// 从 `.docx` 里提取尽量可读的正文文本。
+///
+/// `.docx` 本质上是一个 zip 包，正文通常在 `word/document.xml`，
+/// 其它诸如页眉/页脚/批注/尾注也可能带有可读信息。
+fn extract_docx_text(bytes: &[u8]) -> Option<String> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut sections = Vec::new();
+
+    for index in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(index) else {
+            continue;
+        };
+        let name = entry.name().to_string();
+        if !looks_like_docx_text_entry(&name) {
+            continue;
+        }
+
+        let mut xml = String::new();
+        if std::io::Read::read_to_string(&mut entry, &mut xml).is_err() {
+            continue;
+        }
+
+        let text = extract_wordprocessingml_text(&xml);
+        let text = text.trim();
+        if !text.is_empty() {
+            sections.push(text.to_string());
+        }
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
+/// 过滤出 `.docx` 中真正可能承载人类可读正文的 XML 文件。
+fn looks_like_docx_text_entry(name: &str) -> bool {
+    if !name.starts_with("word/") || !name.ends_with(".xml") {
+        return false;
+    }
+
+    let file_name = name.rsplit('/').next().unwrap_or(name);
+    file_name == "document.xml"
+        || file_name == "footnotes.xml"
+        || file_name == "endnotes.xml"
+        || file_name == "comments.xml"
+        || file_name.starts_with("header")
+        || file_name.starts_with("footer")
+}
+
+/// 从 WordprocessingML 里抽出正文文字。
+///
+/// 这里不尝试完整实现 XML 解析器，只提取最关键的文本与换行语义：
+/// - `<w:t>` / `<w:instrText>`：正文文本
+/// - `<w:tab/>`：制表符
+/// - `<w:br/>` / `<w:cr/>`：显式换行
+/// - `</w:p>` / `</w:tr>`：段落或表格行结束
+fn extract_wordprocessingml_text(xml: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+
+    while cursor < xml.len() {
+        let Some(tag_start_rel) = xml[cursor..].find('<') else {
+            break;
+        };
+        let tag_start = cursor + tag_start_rel;
+        let Some(tag_end_rel) = xml[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_rel;
+        let tag = &xml[tag_start + 1..tag_end];
+        let normalized = tag.trim();
+
+        if normalized.starts_with("w:t") || normalized.starts_with("w:instrText") {
+            let close_tag = if normalized.starts_with("w:t") {
+                "</w:t>"
+            } else {
+                "</w:instrText>"
+            };
+            let content_start = tag_end + 1;
+            if let Some(close_rel) = xml[content_start..].find(close_tag) {
+                let content_end = content_start + close_rel;
+                out.push_str(&decode_xml_entities(&xml[content_start..content_end]));
+                cursor = content_end + close_tag.len();
+                continue;
+            }
+        } else if normalized.starts_with("w:tab") {
+            out.push('\t');
+        } else if normalized.starts_with("w:br") || normalized.starts_with("w:cr") {
+            push_docx_newline(&mut out);
+        } else if normalized.starts_with("/w:p")
+            || normalized.starts_with("/w:tr")
+            || normalized.starts_with("/w:tbl")
+        {
+            push_docx_newline(&mut out);
+        }
+
+        cursor = tag_end + 1;
+    }
+
+    cleanup_docx_text(&out)
+}
+
+/// Word XML 里常见实体的轻量解码器。
+fn decode_xml_entities(input: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+
+    while let Some(rel) = input[cursor..].find('&') {
+        let entity_start = cursor + rel;
+        out.push_str(&input[cursor..entity_start]);
+        let Some(end_rel) = input[entity_start..].find(';') else {
+            out.push_str(&input[entity_start..]);
+            return out;
+        };
+        let entity_end = entity_start + end_rel;
+        let entity = &input[entity_start + 1..entity_end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => decode_numeric_xml_entity(entity),
+        };
+        if let Some(ch) = decoded {
+            out.push(ch);
+        } else {
+            out.push('&');
+            out.push_str(entity);
+            out.push(';');
+        }
+        cursor = entity_end + 1;
+    }
+
+    out.push_str(&input[cursor..]);
+    out
+}
+
+/// 解析 `&#123;` / `&#x7B;` 这类数字实体。
+fn decode_numeric_xml_entity(entity: &str) -> Option<char> {
+    if let Some(decimal) = entity.strip_prefix('#') {
+        let code = if let Some(hex) = decimal.strip_prefix(['x', 'X']) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            decimal.parse::<u32>().ok()?
+        };
+        return char::from_u32(code);
+    }
+    None
+}
+
+/// 给 docx 文本追加一个“最多一个空行”的段落分隔。
+fn push_docx_newline(out: &mut String) {
+    if out.ends_with("\n\n") {
+        return;
+    }
+    out.push('\n');
+}
+
+/// 清理 Word XML 提取后的杂质，让注入上下文的正文更自然。
+fn cleanup_docx_text(input: &str) -> String {
+    let mut cleaned_lines = Vec::new();
+    let mut blank_count = 0;
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if blank_count == 0 {
+                cleaned_lines.push(String::new());
+            }
+            blank_count += 1;
+            continue;
+        }
+        blank_count = 0;
+        cleaned_lines.push(trimmed.to_string());
+    }
+
+    cleaned_lines.join("\n").trim().to_string()
 }
 
 /// 判断消息是否是内部 POST 推送产生的“系统代发消息”。
