@@ -4,7 +4,7 @@
 
 - 在线文档（GitHub Pages，多页面 Wiki）：`https://xinian-dada.github.io/XzBot/`
 - 仓库文档入口：`docs/index.html`
-- 当前 crate 版本：`0.2.1`
+- 当前 crate 版本：`0.2.2`
 
 ## 特性
 

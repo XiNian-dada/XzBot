@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>XzBot Wiki</title>
-  <meta name="description" content="XzBot 多页面在线文档：部署、NapCat、配置、控制台、插件、升级与 FAQ。" />
+  <title>XzBot 使用说明 · XzBot Wiki</title>
+  <meta name="description" content="XzBot 面向普通用户的文档首页：先把机器人跑起来，再对接 NapCat、配置系统、查看控制台和插件。" />
   <link rel="stylesheet" href="assets/site.css" />
   <script defer src="assets/site.js"></script>
 </head>
@@ -12,95 +12,127 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">XzBot Wiki</div>
-      <div class="version">版本 v0.2.1</div>
-      <div class="desc">一套面向“第一次部署、第一次改配置、第一次写插件”的多页面在线文档。</div>
-      <div class="nav-title">开始使用</div>
+      <div class="version">版本 v0.2.2</div>
+      <div class="desc">面向普通用户的文档首页。先看怎么启动，再看怎么接 NapCat，最后再看配置和维护。</div>
+
+      <div class="nav-title">页面</div>
       <nav class="nav-group">
         <a class="nav-link" href="index.html" data-nav="/XzBot/">首页</a>
         <a class="nav-link" href="getting-started/" data-nav="/XzBot/getting-started/">从零部署</a>
         <a class="nav-link" href="napcat/" data-nav="/XzBot/napcat/">NapCat 对接</a>
         <a class="nav-link" href="configuration/" data-nav="/XzBot/configuration/">配置详解</a>
-      </nav>
-      <div class="nav-title">进阶使用</div>
-      <nav class="nav-group">
         <a class="nav-link" href="console/" data-nav="/XzBot/console/">网页控制台</a>
         <a class="nav-link" href="plugins/" data-nav="/XzBot/plugins/">插件系统</a>
         <a class="nav-link" href="release/" data-nav="/XzBot/release/">升级与发版</a>
         <a class="nav-link" href="faq/" data-nav="/XzBot/faq/">常见问题</a>
       </nav>
+
+      <div class="nav-title">本页目录</div>
+      <nav class="nav-group">
+        <a class="nav-link" href="#overview" data-section="overview">项目概览</a>
+        <a class="nav-link" href="#install" data-section="install">先把它跑起来</a>
+        <a class="nav-link" href="#napcat" data-section="napcat">NapCat 怎么接</a>
+        <a class="nav-link" href="#config" data-section="config">配置文件</a>
+        <a class="nav-link" href="#runtime" data-section="runtime">日常使用</a>
+        <a class="nav-link" href="#console" data-section="console">控制台和接口</a>
+        <a class="nav-link" href="#plugins" data-section="plugins">插件系统</a>
+        <a class="nav-link" href="#faq" data-section="faq">常见问题</a>
+      </nav>
     </aside>
 
     <main class="main">
-      <section class="hero">
-        <div class="kicker">Rust · NapCat · OneBot · Multi-LLM · Plugins · Web Console</div>
-        <h1>把 XzBot 当成一个能聊天、能搜索、能看图、能扩展的宿主平台来用。</h1>
-        <p>这套文档已经从单页介绍改成了多页面 wiki 结构。你可以按“从零部署 → 对接 NapCat → 配置 → 控制台 → 插件 → 发版”的顺序一点点照着做，不用一次吃完所有细节。</p>
-        <div class="hero-actions">
-          <a class="btn primary" href="getting-started/">先把机器人跑起来</a>
-          <a class="btn secondary" href="configuration/">我想先看配置</a>
-          <a class="btn secondary" href="https://github.com/XiNian-dada/XzBot">GitHub 仓库</a>
-        </div>
-      </section>
+      <article class="doc">
+        <div class="breadcrumb">首页 / 使用说明</div>
+        <div class="kicker">User Guide</div>
+        <h1>XzBot 使用说明</h1>
+        <p class="lead">这不是宣传页，而是一份按普通使用流程整理的文档：首页先告诉你它能做什么，再带你把机器人跑起来，然后说明怎么配置、怎么接 NapCat、怎么日常维护。</p>
+        <p class="meta">适合第一次接触项目的用户，也适合后面只想快速查路径和命令的人。</p>
 
-      <section class="grid">
-        <article class="card span-4">
-          <div class="kicker">部署入口</div>
-          <h2>1. 从零部署</h2>
-          <p>适合第一次上手。包括：编译、首次运行、生成配置、最小可用配置、怎么确认它真的活着。</p>
-          <p><a href="getting-started/">打开部署教程 →</a></p>
-        </article>
-        <article class="card span-4">
-          <div class="kicker">协议接入</div>
-          <h2>2. NapCat 对接</h2>
-          <p>专门讲反向 WebSocket 怎么配、哪些开关必须开、哪些不用开、常见连不上是哪里出了问题。</p>
-          <p><a href="napcat/">打开 NapCat 教程 →</a></p>
-        </article>
-        <article class="card span-4">
-          <div class="kicker">最复杂但最重要</div>
-          <h2>3. 配置详解</h2>
-          <p>把主配置、覆盖文件、模型接入、搜索、OCR、代理、控制台配置拆开讲，不需要对着一个大 TOML 硬啃。</p>
-          <p><a href="configuration/">打开配置说明 →</a></p>
-        </article>
-        <article class="card span-6">
-          <div class="kicker">运维入口</div>
-          <h2>4. 网页控制台</h2>
-          <p>如果你不想继续手改一堆配置，可以直接用网页面板：看状态、改配置、看日志、看插件、用插件文件管理器改插件侧文本文件。</p>
-          <p><a href="console/">打开控制台说明 →</a></p>
-        </article>
-        <article class="card span-6">
-          <div class="kicker">扩展能力</div>
-          <h2>5. 插件系统</h2>
-          <p>现在的插件已经不是简单命令壳了，支持事件驱动、工具注册、多动作输出和阻断传播。后续新功能建议优先走插件。</p>
-          <p><a href="plugins/">打开插件说明 →</a></p>
-        </article>
-        <article class="card span-6">
-          <div class="kicker">维护者</div>
-          <h2>6. 升级与发版</h2>
-          <p>讲清楚版本号、GitHub Pages、Release 构建、打 tag 的正确顺序，以及现在 CI/CD 是怎么触发的。</p>
-          <p><a href="release/">打开发版说明 →</a></p>
-        </article>
-        <article class="card span-6">
-          <div class="kicker">排障</div>
-          <h2>7. 常见问题</h2>
-          <p>包括 Address in use、NapCat 连不上、模型网关不兼容、控制台打不开、群里前一条消息看不到等典型问题。</p>
-          <p><a href="faq/">打开 FAQ →</a></p>
-        </article>
-      </section>
+        <hr />
 
-      <section class="panel">
-        <div class="kicker">推荐阅读顺序</div>
-        <h2>如果你是第一次接触这个项目，建议按这个顺序走</h2>
-        <ol>
-          <li>先看 <a href="getting-started/">从零部署</a>，把机器人跑起来。</li>
-          <li>再看 <a href="napcat/">NapCat 对接</a>，确认消息链路真的通了。</li>
-          <li>然后看 <a href="configuration/">配置详解</a>，把真实模型、搜索、OCR 配上。</li>
-          <li>接着看 <a href="console/">网页控制台</a>，以后日常维护会轻松很多。</li>
-          <li>最后再看 <a href="plugins/">插件系统</a> 和 <a href="release/">升级与发版</a>。</li>
-        </ol>
-        <div class="callout">如果你只是想先确认链路能跑，<strong>先把 <code>[ai].provider</code> 设成 <code>mock</code></strong>。这个建议非常省时间。</div>
-      </section>
+        <section>
+          <h2 id="overview">项目概览</h2>
+          <p>XzBot 是一个基于 Rust + Tokio + Axum 的 QQ 机器人宿主，使用 NapCat 的 OneBot v11 反向 WebSocket 接入。它能处理群消息、调用 LLM、做图片 OCR、走网页搜索，也能把功能拆成插件扩展出去。</p>
+          <ul>
+            <li>消息接入走反向 WebSocket，不需要你自己暴露额外的公网回调。</li>
+            <li>LLM 后端支持 OpenAI 兼容、Anthropic 兼容和 Mock。</li>
+            <li>图片理解和 OCR 都已经接到主流程里了。</li>
+            <li>插件系统、网页控制台、外部推送接口都已经在运行时里。</li>
+          </ul>
+          <p>如果你只想先验证链路，先把 <code>[ai].provider</code> 设成 <code>mock</code>，最省时间。</p>
+        </section>
+
+        <section>
+          <h2 id="install">先把它跑起来</h2>
+          <p>依赖只有 Rust 1.75+ 和 NapCat。最短路径如下：</p>
+          <pre><code>cargo build --release
+./target/release/xzbot</code></pre>
+          <p>程序会从可执行文件所在目录读取配置，默认主配置是 <code>./config/config.toml</code>。首次启动时会自动生成模板，后续你主要改这个目录下的文件。</p>
+          <p>如果你还没准备真实模型，先用 <code>mock</code> 跑通消息链路，再换成正式网关。</p>
+        </section>
+
+        <section>
+          <h2 id="napcat">NapCat 怎么接</h2>
+          <p>XzBot 使用的是 <strong>OneBot v11 反向 WebSocket</strong>。也就是说，是 NapCat 主动连过来，不是 XzBot 去推给它。</p>
+          <pre><code>ws://&lt;主机IP&gt;:3000/onebot/v11/ws</code></pre>
+          <p>其中 <code>3000</code> 来自 <code>[server].port</code>，<code>/onebot/v11/ws</code> 来自 <code>[server].ws_path</code>。如果你打开了 token 校验，两边填同一个值即可。</p>
+        </section>
+
+        <section>
+          <h2 id="config">配置文件怎么理解</h2>
+          <p>默认布局是“一个主配置 + 多个可选覆盖文件”。普通用户通常只需要改 <code>config/config.toml</code>；如果某一块变长了，再拆到单独的覆盖文件里，例如 <code>persona.toml</code>、<code>ai.toml</code>、<code>search.toml</code>、<code>network.toml</code>。</p>
+          <p>覆盖文件默认都关闭，顶层会有 <code>enabled = false</code>。想让它生效，就把它改成 <code>true</code>。</p>
+          <pre><code># config/config.toml
+[owner]
+qq = 123456789
+
+[group]
+whitelist = [123456789]
+trigger_mode = "at"
+
+[ai]
+provider = "mock"</code></pre>
+          <p>代码里也支持旧版单文件配置迁移，但新项目还是建议按目录结构来，后面更好维护。</p>
+        </section>
+
+        <section>
+          <h2 id="runtime">日常使用看什么</h2>
+          <p>XzBot 的日常行为比较直接：</p>
+          <ul>
+            <li>触发方式支持 <code>@</code>、前缀和关键词，具体看 <code>[group].trigger_mode</code>。</li>
+            <li>上下文目前是内存存储，重启后会清空。</li>
+            <li>内置工具包括网页搜索、URL 抓取、系统信息、进程信息和天气查询。</li>
+            <li>权限模式支持 <code>None</code>、<code>OwnerOnly</code> 和 <code>Whitelist</code>。</li>
+            <li>运行时命令包括 <code>/reset</code>、<code>/blacklist</code>、<code>/reload</code>、<code>/log</code>、<code>/posttoken</code>。</li>
+          </ul>
+          <p>如果你发现机器人没回复，先看这三件事：群是否在白名单里、触发方式是否设置对、模型网关是否真的可用。</p>
+        </section>
+
+        <section>
+          <h2 id="console">控制台和外部接口</h2>
+          <p>程序还提供了网页控制台和外部推送接口。控制台默认挂在 <code>/admin</code>，是否启用和 token 由 <code>[web_admin]</code> 管。外部 POST 推送接口是 <code>/api/post/send</code>，用于把文本、图片或文件发到指定会话。</p>
+          <p>如果你更想少改配置、多看状态，控制台会比直接手工编辑 TOML 轻松很多。</p>
+        </section>
+
+        <section>
+          <h2 id="plugins">插件系统</h2>
+          <p>插件目录在项目运行目录下的 <code>Plugins/</code>。当前实现已经不只是简单命令壳，还支持事件订阅和工具注册，所以后续新增能力尽量优先做成插件。</p>
+          <p>插件最适合放这三类东西：命令、事件处理和给 AI 暴露的新工具。</p>
+        </section>
+
+        <section>
+          <h2 id="faq">常见问题</h2>
+          <ul>
+            <li>如果提示 <code>Address in use</code>，先停掉旧进程，或者换一个端口。</li>
+            <li>如果 NapCat 连不上，优先检查地址、端口和 token 是否一致。</li>
+            <li>如果模型一直失败，先用 <code>mock</code> 验证链路，再换真实网关。</li>
+            <li>如果看不到群消息，先检查白名单和触发模式，不要先怀疑 AI。</li>
+          </ul>
+          <p>后面想继续细看，可以按左侧顺序打开 <a href="getting-started/">从零部署</a>、<a href="napcat/">NapCat 对接</a>、<a href="configuration/">配置详解</a>、<a href="console/">网页控制台</a>、<a href="plugins/">插件系统</a>、<a href="release/">升级与发版</a>、<a href="faq/">常见问题</a>。</p>
+        </section>
+      </article>
     </main>
   </div>
-  <div class="footer">XzBot 多页面在线文档 · GitHub Pages</div>
+  <div class="footer">XzBot Wiki · 面向普通用户的文档首页</div>
 </body>
 </html>

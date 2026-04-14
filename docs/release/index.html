@@ -11,7 +11,7 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">XzBot Wiki</div>
-      <div class="version">版本 v0.2.1</div>
+      <div class="version">版本 v0.2.2</div>
       <div class="desc">当前页面：升级与发版</div>
       <nav class="nav-group">
         <a class="nav-link" href="../">首页</a>
@@ -38,14 +38,14 @@
 
         <h3>2. 正确的发版顺序</h3>
         <pre><code># 修改版本号
-# Cargo.toml -> version = "0.2.1"
+# Cargo.toml -> version = "0.2.2"
 
 git add .
-git commit -m "release: v0.2.1"
+git commit -m "release: v0.2.2"
 git push origin main
 
-git tag v0.2.1
-git push origin v0.2.1</code></pre>
+git tag v0.2.2
+git push origin v0.2.2</code></pre>
 
         <h3>3. 为什么你刚才看到 Release workflow 失败</h3>
         <p>我本地已经复现过 <code>x86_64-unknown-linux-musl</code> 的 release 构建，当前代码本身是能过的。所以截图里那次更像是 GitHub Actions 侧的单点失败，而不是代码已经坏了。</p>
